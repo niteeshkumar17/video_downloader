@@ -7,6 +7,7 @@ import threading
 import base64
 from flask import Flask, request, jsonify, send_file, render_template
 from flask_cors import CORS
+from pytubefix import YouTube
 
 app = Flask(__name__)
 CORS(app)
@@ -52,7 +53,38 @@ def cleanup_old_files():
 def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
+    
+    # PYTUBEFIX YOUTUBE FALLBACK
+    if "youtube.com" in url or "youtu.be" in url:
+        try:
+            yt = YouTube(url)
+            job["title"] = yt.title
+            if format_choice == "audio":
+                stream = yt.streams.get_audio_only()
+                filename = f"{job_id}.mp3"
+            else:
+                stream = yt.streams.get_highest_resolution() 
+                filename = f"{job_id}.mp4"
+                
+            out_file = stream.download(output_path=DOWNLOAD_DIR, filename=filename)
+            
+            job["status"] = "done"
+            job["file"] = out_file
+            ext = os.path.splitext(out_file)[1]
+            title = job.get("title", "").strip()
+            if title:
+                safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:80].strip()
+                job["filename"] = f"{safe_title}{ext}" if safe_title else os.path.basename(out_file)
+            else:
+                job["filename"] = os.path.basename(out_file)
+            return
 
+        except Exception as e:
+            job["status"] = "error"
+            job["error"] = f"YouTube Download Error: {str(e)}"
+            return
+
+    # NORMAL YT-DLP EXECUTION
     cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "-o", out_template] + get_cookie_args()
 
     if format_choice == "audio":
@@ -121,6 +153,28 @@ def get_info():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
+    # PYTUBEFIX YOUTUBE FALLBACK
+    if "youtube.com" in url or "youtu.be" in url:
+        try:
+            yt = YouTube(url)
+            duration = yt.length
+            return jsonify({
+                "title": yt.title,
+                "thumbnail": yt.thumbnail_url,
+                "duration": duration,
+                "uploader": yt.author,
+                "formats": [
+                    {
+                        "id": "pytubefix_720",
+                        "label": "720p (Max Pytube)",
+                        "height": 720,
+                    }
+                ],
+            })
+        except Exception as e:
+            return jsonify({"error": f"YouTube Fetch Error: {str(e)}"}), 400
+
+    # NORMAL YT-DLP EXECUTION
     cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "-j"] + get_cookie_args() + [url]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
