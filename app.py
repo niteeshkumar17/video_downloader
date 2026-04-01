@@ -4,6 +4,7 @@ import glob
 import json
 import subprocess
 import threading
+import base64
 from flask import Flask, request, jsonify, send_file, render_template
 from flask_cors import CORS
 
@@ -12,6 +13,26 @@ CORS(app)
 
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
+
+# If YTDLP_COOKIES env var is set (base64 encoded cookies.txt), write it to file
+if os.environ.get("YTDLP_COOKIES"):
+    try:
+        decoded = base64.b64decode(os.environ["YTDLP_COOKIES"])
+        with open(COOKIES_FILE, "wb") as f:
+            f.write(decoded)
+        print("Loaded cookies from YTDLP_COOKIES environment variable")
+    except Exception as e:
+        print(f"Failed to decode YTDLP_COOKIES: {e}")
+
+
+def get_cookie_args():
+    """Return cookie arguments for yt-dlp if cookies.txt exists."""
+    if os.path.isfile(COOKIES_FILE):
+        return ["--cookies", COOKIES_FILE]
+    return []
+
 
 jobs = {}
 
@@ -32,7 +53,7 @@ def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
 
-    cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
+    cmd = ["yt-dlp", "--no-playlist", "-o", out_template] + get_cookie_args()
 
     if format_choice == "audio":
         cmd += ["-x", "--audio-format", "mp3"]
@@ -99,7 +120,7 @@ def get_info():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    cmd = ["yt-dlp", "--no-playlist", "-j", url]
+    cmd = ["yt-dlp", "--no-playlist", "-j"] + get_cookie_args() + [url]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
