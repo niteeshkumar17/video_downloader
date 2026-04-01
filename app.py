@@ -121,7 +121,7 @@ def get_info():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "--dump-json", "--skip-download"] + get_cookie_args() + [url]
+    cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "-j"] + get_cookie_args() + [url]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
