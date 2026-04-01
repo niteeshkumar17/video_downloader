@@ -67,58 +67,97 @@ def cleanup_old_files():
             pass
 
 
+# Clients to try in order — WEB triggers auto PO token generation via nodejs
+PYTUBE_CLIENTS = ['WEB', 'WEB_EMBED', 'ANDROID']
+
+
+def _create_youtube(url, client=None):
+    """Create a pytubefix YouTube object with the given client."""
+    from pytubefix import YouTube
+    if client:
+        return YouTube(url, client=client)
+    return YouTube(url)
+
+
 # ── pytubefix-based YouTube handlers ────────────────────────────────────────
 
 def pytube_get_info(url):
-    """Fetch video info using pytubefix (bypasses bot detection via Innertube API)."""
-    from pytubefix import YouTube
+    """Fetch video info using pytubefix with PO token via auto client rotation."""
+    last_error = None
+    for client in PYTUBE_CLIENTS:
+        try:
+            logger.info(f"pytubefix: trying client={client} for info")
+            yt = _create_youtube(url, client=client)
 
-    yt = YouTube(url)
+            # Build quality options from available streams
+            formats = []
+            seen_heights = set()
 
-    # Build quality options from available streams
-    formats = []
-    seen_heights = set()
+            # Get adaptive video streams for high quality options
+            for stream in yt.streams.filter(adaptive=True, only_video=True).order_by("resolution").desc():
+                height = stream.resolution  # e.g. "1080p"
+                if height and height not in seen_heights:
+                    seen_heights.add(height)
+                    height_int = int(height.replace("p", ""))
+                    formats.append({
+                        "id": f"pytube_{stream.itag}",
+                        "label": height,
+                        "height": height_int,
+                    })
 
-    # Get adaptive video streams for high quality options
-    for stream in yt.streams.filter(adaptive=True, only_video=True).order_by("resolution").desc():
-        height = stream.resolution  # e.g. "1080p"
-        if height and height not in seen_heights:
-            seen_heights.add(height)
-            height_int = int(height.replace("p", ""))
-            formats.append({
-                "id": f"pytube_{stream.itag}",
-                "label": height,
-                "height": height_int,
-            })
+            # Also include progressive streams as fallback
+            for stream in yt.streams.filter(progressive=True).order_by("resolution").desc():
+                height = stream.resolution
+                if height and height not in seen_heights:
+                    seen_heights.add(height)
+                    height_int = int(height.replace("p", ""))
+                    formats.append({
+                        "id": f"pytube_prog_{stream.itag}",
+                        "label": f"{height}",
+                        "height": height_int,
+                    })
 
-    # Also include progressive streams as fallback
-    for stream in yt.streams.filter(progressive=True).order_by("resolution").desc():
-        height = stream.resolution
-        if height and height not in seen_heights:
-            seen_heights.add(height)
-            height_int = int(height.replace("p", ""))
-            formats.append({
-                "id": f"pytube_prog_{stream.itag}",
-                "label": f"{height}",
-                "height": height_int,
-            })
+            formats.sort(key=lambda x: x["height"], reverse=True)
 
-    formats.sort(key=lambda x: x["height"], reverse=True)
-
-    return {
-        "title": yt.title or "",
-        "thumbnail": yt.thumbnail_url or "",
-        "duration": yt.length,
-        "uploader": yt.author or "",
-        "formats": formats,
-    }
+            result = {
+                "title": yt.title or "",
+                "thumbnail": yt.thumbnail_url or "",
+                "duration": yt.length,
+                "uploader": yt.author or "",
+                "formats": formats,
+            }
+            logger.info(f"pytubefix: client={client} succeeded for info")
+            return result
+        except Exception as e:
+            last_error = e
+            logger.warning(f"pytubefix: client={client} failed for info: {e}")
+    raise Exception(f"All pytubefix clients failed. Last error: {last_error}")
 
 
 def pytube_download(job_id, url, format_choice, format_id):
-    """Download a YouTube video using pytubefix."""
-    from pytubefix import YouTube
+    """Download a YouTube video using pytubefix with auto PO token via client rotation."""
+    last_error = None
+    for client in PYTUBE_CLIENTS:
+        try:
+            logger.info(f"pytubefix: trying client={client} for download")
+            result = _pytube_download_with_client(job_id, url, format_choice, format_id, client)
+            logger.info(f"pytubefix: client={client} succeeded for download")
+            return result
+        except Exception as e:
+            last_error = e
+            logger.warning(f"pytubefix: client={client} failed for download: {e}")
+            # Clean up partial files before trying next client
+            for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}*")):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+    raise Exception(f"All pytubefix clients failed. Last error: {last_error}")
 
-    yt = YouTube(url)
+
+def _pytube_download_with_client(job_id, url, format_choice, format_id, client):
+    """Internal download function using a specific pytubefix client."""
+    yt = _create_youtube(url, client=client)
     output_path = DOWNLOAD_DIR
 
     if format_choice == "audio":
@@ -456,6 +495,54 @@ def download_file(job_id):
     if not job or job["status"] != "done":
         return jsonify({"error": "File not ready"}), 404
     return send_file(job["file"], as_attachment=True, download_name=job["filename"])
+
+
+@app.route("/api/debug", methods=["POST"])
+def debug_info():
+    """Debug endpoint to test pytubefix and yt-dlp on the server."""
+    import traceback
+    data = request.json or {}
+    url = data.get("url", "https://www.youtube.com/watch?v=ZtmYzyY9hf0").strip()
+    results = {"url": url, "pytubefix_clients": {}, "ytdlp": {}}
+
+    # Test each pytubefix client
+    for client in PYTUBE_CLIENTS:
+        try:
+            yt = _create_youtube(url, client=client)
+            title = yt.title
+            streams_count = len(yt.streams)
+            results["pytubefix_clients"][client] = {
+                "status": "success",
+                "title": title,
+                "streams": streams_count,
+            }
+        except Exception as e:
+            results["pytubefix_clients"][client] = {
+                "status": "error",
+                "error": str(e),
+                "traceback": traceback.format_exc()[-500:],
+            }
+
+    # Test yt-dlp
+    cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "-j"] + get_cookie_args() + [url]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            info = json.loads(result.stdout)
+            results["ytdlp"] = {"status": "success", "title": info.get("title")}
+        else:
+            results["ytdlp"] = {"status": "error", "stderr": result.stderr[-500:]}
+    except Exception as e:
+        results["ytdlp"] = {"status": "error", "error": str(e)}
+
+    # Check node.js
+    try:
+        node_result = subprocess.run(["node", "--version"], capture_output=True, text=True, timeout=5)
+        results["nodejs_version"] = node_result.stdout.strip()
+    except Exception as e:
+        results["nodejs_version"] = f"NOT FOUND: {e}"
+
+    return jsonify(results)
 
 
 if __name__ == "__main__":
