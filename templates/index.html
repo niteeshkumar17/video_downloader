@@ -603,7 +603,7 @@
     <div class="input-wrapper">
       <textarea id="urls" placeholder="Paste one or more video URLs here..." rows="2"></textarea>
     </div>
-    <p class="hint">💡 Multiple links? Separate with spaces, commas, or new lines.</p>
+    <p class="hint">Multiple links? Separate with spaces, commas, or new lines.</p>
 
     <!-- Controls -->
     <div class="controls">
@@ -623,18 +623,18 @@
     <div class="supported">
       <div class="supported-label">Works with 1000+ sites including</div>
       <div class="supported-grid">
-        <span class="site-badge">▶ YouTube</span>
-        <span class="site-badge">♪ TikTok</span>
-        <span class="site-badge">📷 Instagram</span>
-        <span class="site-badge">𝕏 Twitter/X</span>
-        <span class="site-badge">🔴 Reddit</span>
-        <span class="site-badge">📘 Facebook</span>
-        <span class="site-badge">▷ Vimeo</span>
-        <span class="site-badge">🟣 Twitch</span>
-        <span class="site-badge">🎵 SoundCloud</span>
-        <span class="site-badge">📌 Pinterest</span>
-        <span class="site-badge">🔗 LinkedIn</span>
-        <span class="site-badge">✨ 1000+ more</span>
+        <span class="site-badge">YouTube</span>
+        <span class="site-badge">TikTok</span>
+        <span class="site-badge">Instagram</span>
+        <span class="site-badge">Twitter/X</span>
+        <span class="site-badge">Reddit</span>
+        <span class="site-badge">Facebook</span>
+        <span class="site-badge">Vimeo</span>
+        <span class="site-badge">Twitch</span>
+        <span class="site-badge">SoundCloud</span>
+        <span class="site-badge">Pinterest</span>
+        <span class="site-badge">LinkedIn</span>
+        <span class="site-badge">1000+ more</span>
       </div>
     </div>
 
@@ -814,7 +814,7 @@
         actionHtml = `<span class="card-status downloading"><span class="spin"></span> Downloading...</span>`;
       } else if (c.status === 'done') {
         actionHtml = `<button class="card-dl-btn done" onclick="saveCard(${idx})">Save File</button>
-          <span class="card-status done">✓ ${esc(c.filename || '')}</span>`;
+          <span class="card-status done">${esc(c.filename || '')}</span>`;
       } else if (c.status === 'error') {
         actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Retry</button>
           <span class="card-status error">${esc(friendlyError(c.error || 'Download failed'))}</span>`;
@@ -837,7 +837,7 @@
       const bar = document.createElement('div');
       bar.id = 'dl-all-bar';
       bar.className = 'dl-all-bar';
-      bar.innerHTML = `<button class="dl-all-btn" onclick="dlAll()">⬇ Download All</button>`;
+      bar.innerHTML = `<button class="dl-all-btn" onclick="dlAll()">Download All</button>`;
       document.getElementById('cards').appendChild(bar);
     }
 
@@ -934,7 +934,7 @@
         }
       }
 
-      if (btn) { btn.disabled = false; btn.textContent = '⬇ Download All'; }
+      if (btn) { btn.disabled = false; btn.textContent = 'Download All'; }
     }
   </script>
 </body>
