@@ -1,5 +1,5 @@
 flask
 flask-cors
 yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/refs/heads/master.tar.gz
-yt-dlp-ejs
+pytubefix
 gunicorn
