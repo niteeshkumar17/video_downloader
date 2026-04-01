@@ -53,12 +53,13 @@ def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
 
-    cmd = ["yt-dlp", "--no-playlist", "-o", out_template] + get_cookie_args()
+    cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "-o", out_template] + get_cookie_args()
 
     if format_choice == "audio":
         cmd += ["-x", "--audio-format", "mp3"]
     elif format_id:
-        cmd += ["-f", f"{format_id}+bestaudio/best", "--merge-output-format", "mp4"]
+        # Use fallback chain: requested format, then best with height, then just best
+        cmd += ["-f", f"{format_id}+bestaudio/{format_id}/bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
     else:
         cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
 
@@ -120,7 +121,7 @@ def get_info():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    cmd = ["yt-dlp", "--no-playlist", "-j"] + get_cookie_args() + [url]
+    cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "--dump-json", "--skip-download"] + get_cookie_args() + [url]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
