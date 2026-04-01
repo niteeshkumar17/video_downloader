@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 downloads/
 .env
+cookies.txt
 *.egg-info/
 dist/
 build/
