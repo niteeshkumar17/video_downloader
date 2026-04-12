@@ -7,6 +7,7 @@ import subprocess
 import threading
 import base64
 import logging
+from urllib.parse import parse_qs, urlparse
 from flask import Flask, request, jsonify, send_file, render_template
 from flask_cors import CORS
 
@@ -61,6 +62,49 @@ def is_youtube_url(url):
         r"(https?://)?m\.youtube\.com/watch",
     ]
     return any(re.match(pattern, url) for pattern in youtube_patterns)
+
+
+def normalize_video_url(url):
+    """Normalize known URL variants to improve extractor compatibility."""
+    url = (url or "").strip()
+    if not url:
+        return url
+
+    try:
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        path = parsed.path or ""
+
+        # youtu.be/<id> -> youtube watch URL
+        if "youtu.be" in host:
+            video_id = path.strip("/").split("/")[0]
+            if video_id:
+                return f"https://www.youtube.com/watch?v={video_id}"
+
+        if "youtube.com" in host or "m.youtube.com" in host:
+            # /shorts/<id> -> watch
+            if path.startswith("/shorts/"):
+                video_id = path.split("/shorts/", 1)[1].split("/")[0]
+                if video_id:
+                    return f"https://www.youtube.com/watch?v={video_id}"
+
+            # /embed/<id> -> watch
+            if path.startswith("/embed/"):
+                video_id = path.split("/embed/", 1)[1].split("/")[0]
+                if video_id:
+                    return f"https://www.youtube.com/watch?v={video_id}"
+
+            # Keep watch URLs canonical
+            if path == "/watch":
+                qs = parse_qs(parsed.query or "")
+                video_id = (qs.get("v") or [""])[0]
+                if video_id:
+                    return f"https://www.youtube.com/watch?v={video_id}"
+    except Exception:
+        # If parsing fails, use original input.
+        return url
+
+    return url
 
 
 def normalize_ytdlp_error(error_message, is_youtube=False):
@@ -467,7 +511,7 @@ def index():
 @app.route("/api/info", methods=["POST"])
 def get_info():
     data = request.json
-    url = data.get("url", "").strip()
+    url = normalize_video_url(data.get("url", ""))
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
@@ -495,7 +539,7 @@ def start_download():
     cleanup_old_files()
 
     data = request.json
-    url = data.get("url", "").strip()
+    url = normalize_video_url(data.get("url", ""))
     format_choice = data.get("format", "video")
     format_id = data.get("format_id")
     title = data.get("title", "")
@@ -538,7 +582,7 @@ def debug_info():
     """Debug endpoint to test pytubefix and yt-dlp on the server."""
     import traceback
     data = request.json or {}
-    url = data.get("url", "https://www.youtube.com/watch?v=ZtmYzyY9hf0").strip()
+    url = normalize_video_url(data.get("url", "https://www.youtube.com/watch?v=ZtmYzyY9hf0"))
     results = {"url": url, "pytubefix_clients": {}, "ytdlp": {}}
     results["cookie_mode"] = "browser" if COOKIES_FROM_BROWSER else ("file" if os.path.isfile(COOKIES_FILE) else "none")
 
