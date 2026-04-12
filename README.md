@@ -2,8 +2,6 @@
 
 A self-hosted video and audio downloader with a clean, modern web UI. Paste links from YouTube, TikTok, Instagram, Twitter/X, and 1000+ other sites — download as MP4 or MP3.
 
-Inspired by [ReClip](https://github.com/averygan/reclip).
-
 ## Features
 
 - 🎬 Download videos from 1000+ supported sites (via [yt-dlp](https://github.com/yt-dlp/yt-dlp))
