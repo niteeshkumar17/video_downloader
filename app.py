@@ -523,6 +523,17 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/healthz")
+@app.route("/api/health")
+def health_check():
+    """Lightweight health endpoint for uptime monitors."""
+    return jsonify({
+        "status": "ok",
+        "service": "clipdown",
+        "cookie_mode": "browser" if COOKIES_FROM_BROWSER else ("file" if os.path.isfile(COOKIES_FILE) else "none"),
+    })
+
+
 @app.route("/api/info", methods=["POST"])
 def get_info():
     data = request.json

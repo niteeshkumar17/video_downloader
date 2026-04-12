@@ -50,6 +50,18 @@ docker run -p 8899:8899 clipdown
 
 The `Dockerfile` handles everything — Python, ffmpeg, yt-dlp, and gunicorn.
 
+## UptimeRobot Keep-Alive
+
+To reduce Render cold starts, configure UptimeRobot to ping this lightweight endpoint:
+
+- URL: `https://YOUR-DOMAIN/api/health` (or `https://YOUR-DOMAIN/healthz`)
+- Method: `GET`
+- Interval: every `5` minutes
+- Timeout: `30` seconds
+- Expected body contains: `"status":"ok"`
+
+Note: keep-alive helps with idle spin-down. It does not fix YouTube datacenter IP trust/bot-check restrictions.
+
 ## YouTube Notes (Important)
 
 - This app does not bypass YouTube access controls.
