@@ -50,6 +50,15 @@ docker run -p 8899:8899 clipdown
 
 The `Dockerfile` handles everything — Python, ffmpeg, yt-dlp, and gunicorn.
 
+## YouTube Notes (Important)
+
+- This app does not bypass YouTube access controls.
+- Some YouTube videos require a valid logged-in session (cookies).
+- Local run option: set `YTDLP_COOKIES_FROM_BROWSER` (example: `chrome`) so yt-dlp reads cookies from your browser profile.
+- Server option: provide fresh exported cookies via `YTDLP_COOKIES` (base64-encoded `cookies.txt`).
+- If you see `Login with OAuth is no longer supported`, refresh/export cookies again and retry.
+- Never commit real cookie files to git.
+
 ## Tech Stack
 
 - **Backend**: Python + Flask

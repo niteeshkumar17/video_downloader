@@ -3,6 +3,9 @@ __pycache__/
 downloads/
 .env
 cookies.txt
+bad_cookies.txt
+err.txt
+out.txt
 *.egg-info/
 dist/
 build/

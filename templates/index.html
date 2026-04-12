@@ -664,12 +664,6 @@
       return /(?:youtube\.com\/(?:watch|shorts|embed)|youtu\.be\/|m\.youtube\.com\/watch)/i.test(url);
     }
 
-    function openCobalt(url, mode) {
-      // cobalt.tools accepts URLs directly — open it for the user
-      const cobaltUrl = 'https://cobalt.tools';
-      window.open(cobaltUrl, '_blank');
-    }
-
     function fmtDur(s) {
       if (!s) return '';
       const h = Math.floor(s / 3600);
@@ -686,6 +680,11 @@
     }
 
     function friendlyError(err) {
+      err = String(err || '');
+      if (err.includes('valid logged-in session')) return err;
+      if (err.includes('Login with OAuth is no longer supported')) return 'YouTube requires fresh logged-in cookies';
+      if (err.includes('Use --cookies-from-browser or --cookies')) return 'YouTube requires browser cookies for this video';
+      if (err.includes('Sign in to confirm')) return 'YouTube requires sign-in for this video';
       if (err.includes('Unsupported URL')) return 'This URL is not supported';
       if (err.includes('Video unavailable')) return 'Video is unavailable or private';
       if (err.includes('Private video')) return 'This video is private';
@@ -782,9 +781,8 @@
       // Error state
       if (c.status === 'info-error') {
         el.className = 'card card-error';
-        const cobaltBtn = c.isYouTube
-          ? `<button class="card-dl-btn" style="margin-top:8px;background:linear-gradient(135deg,#e74c3c,#e67e22)" onclick="openCobalt('${c.url}', '${currentFormat}')">Open in Cobalt ↗</button>`
-          : '';
+        const title = c.isYouTube ? 'Could not access YouTube video' : 'Could not fetch video';
+        const message = esc(friendlyError(c.error || ''));
         el.innerHTML = `
           <div class="card-thumb">
             <div class="card-error-icon">
@@ -792,10 +790,9 @@
             </div>
           </div>
           <div class="card-body">
-            <div class="card-title" style="color:var(--error)">${c.isYouTube ? 'YouTube blocked on server' : 'Could not fetch video'}</div>
-            <div class="card-error-msg">${c.isYouTube ? 'YouTube blocks datacenter IPs. Use Cobalt to download:' : esc(friendlyError(c.error || ''))}</div>
+            <div class="card-title" style="color:var(--error)">${title}</div>
+            <div class="card-error-msg">${message}</div>
             <div class="card-error-url">${esc(c.url)}</div>
-            ${cobaltBtn}
           </div>
         `;
         return;

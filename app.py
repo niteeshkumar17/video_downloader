@@ -21,6 +21,7 @@ DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
+COOKIES_FROM_BROWSER = os.environ.get("YTDLP_COOKIES_FROM_BROWSER", "").strip()
 
 # If YTDLP_COOKIES env var is set (base64 encoded cookies.txt), write it to file
 if os.environ.get("YTDLP_COOKIES"):
@@ -32,9 +33,19 @@ if os.environ.get("YTDLP_COOKIES"):
     except Exception as e:
         logger.error(f"Failed to decode YTDLP_COOKIES: {e}")
 
+if COOKIES_FROM_BROWSER:
+    logger.info(f"Using browser cookies via YTDLP_COOKIES_FROM_BROWSER={COOKIES_FROM_BROWSER}")
+
 
 def get_cookie_args():
-    """Return cookie arguments for yt-dlp if cookies.txt exists."""
+    """Return cookie arguments for yt-dlp.
+
+    Priority:
+    1) YTDLP_COOKIES_FROM_BROWSER (local/runtime browser profile)
+    2) cookies.txt file
+    """
+    if COOKIES_FROM_BROWSER:
+        return ["--cookies-from-browser", COOKIES_FROM_BROWSER]
     if os.path.isfile(COOKIES_FILE):
         return ["--cookies", COOKIES_FILE]
     return []
@@ -50,6 +61,50 @@ def is_youtube_url(url):
         r"(https?://)?m\.youtube\.com/watch",
     ]
     return any(re.match(pattern, url) for pattern in youtube_patterns)
+
+
+def normalize_ytdlp_error(error_message, is_youtube=False):
+    """Convert raw yt-dlp errors into short actionable messages."""
+    message = (error_message or "").strip()
+    if not message:
+        return "Unknown error"
+
+    if is_youtube:
+        lowered = message.lower()
+        youtube_auth_markers = [
+            "login with oauth is no longer supported",
+            "use --cookies-from-browser or --cookies",
+            "sign in to confirm",
+            "confirm your age",
+            "confirm you're not a bot",
+        ]
+        if any(marker in lowered for marker in youtube_auth_markers):
+            return (
+                "YouTube requires a valid logged-in session for this video. "
+                "Use fresh browser cookies (set YTDLP_COOKIES_FROM_BROWSER=chrome) "
+                "or provide a fresh cookies.txt via YTDLP_COOKIES."
+            )
+
+    return message.split("\n")[-1]
+
+
+def build_ytdlp_strategies(url):
+    """Build retry strategies for yt-dlp args."""
+    cookie_args = get_cookie_args()
+    if is_youtube_url(url):
+        youtube_overrides = [
+            [],
+            ["--extractor-args", "youtube:player_client=web_safari"],
+            ["--extractor-args", "youtube:player_client=android"],
+        ]
+
+        strategies = []
+        if cookie_args:
+            strategies.extend([cookie_args + override for override in youtube_overrides])
+        strategies.extend(youtube_overrides)
+        return strategies
+
+    return [cookie_args] if cookie_args else [[]]
 
 
 jobs = {}
@@ -250,21 +305,8 @@ def _pytube_download_with_client(job_id, url, format_choice, format_id, client):
 
 def ytdlp_get_info(url):
     """Fetch video info using yt-dlp (with retry strategies for YouTube)."""
-    # Strategy list for YouTube
-    strategies = []
-    if is_youtube_url(url):
-        strategies = [
-            # Strategy 1: cookies + default
-            get_cookie_args(),
-            # Strategy 2: cookies + web_safari client
-            get_cookie_args() + ["--extractor-args", "youtube:player_client=web_safari"],
-            # Strategy 3: cookies + mediaconnect client
-            get_cookie_args() + ["--extractor-args", "youtube:player_client=mediaconnect"],
-            # Strategy 4: no cookies, web_safari
-            ["--extractor-args", "youtube:player_client=web_safari"],
-        ]
-    else:
-        strategies = [get_cookie_args()]
+    youtube = is_youtube_url(url)
+    strategies = build_ytdlp_strategies(url)
 
     last_error = "Unknown error"
     for extra_args in strategies:
@@ -299,21 +341,23 @@ def ytdlp_get_info(url):
                     "formats": formats,
                 }
             else:
-                last_error = result.stderr.strip().split("\n")[-1]
+                stderr = (result.stderr or result.stdout or "").strip()
+                last_error = normalize_ytdlp_error(stderr, youtube)
                 logger.warning(f"yt-dlp strategy failed: {last_error}")
         except subprocess.TimeoutExpired:
             last_error = "Timed out fetching video info"
         except Exception as e:
             last_error = str(e)
 
-    raise Exception(last_error)
+    raise Exception(normalize_ytdlp_error(last_error, youtube))
 
 
 def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
+    youtube = is_youtube_url(url)
 
     # ── Try pytubefix first for YouTube URLs ────────────────────────────────
-    if is_youtube_url(url):
+    if youtube:
         try:
             logger.info(f"[{job_id}] Attempting pytubefix download for YouTube URL")
             filepath, title = pytube_download(job_id, url, format_choice, format_id)
@@ -355,16 +399,7 @@ def run_download(job_id, url, format_choice, format_id):
     else:
         format_args = ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
 
-    strategies = []
-    if is_youtube_url(url):
-        strategies = [
-            get_cookie_args(),
-            get_cookie_args() + ["--extractor-args", "youtube:player_client=web_safari"],
-            get_cookie_args() + ["--extractor-args", "youtube:player_client=mediaconnect"],
-            ["--extractor-args", "youtube:player_client=web_safari"],
-        ]
-    else:
-        strategies = [get_cookie_args()]
+    strategies = build_ytdlp_strategies(url)
 
     last_error = "Unknown error"
     for extra_args in strategies:
@@ -411,7 +446,8 @@ def run_download(job_id, url, format_choice, format_id):
                 else:
                     last_error = "Download completed but no file was found"
             else:
-                last_error = result.stderr.strip().split("\n")[-1]
+                stderr = (result.stderr or result.stdout or "").strip()
+                last_error = normalize_ytdlp_error(stderr, youtube)
                 logger.warning(f"[{job_id}] yt-dlp strategy failed: {last_error}")
         except subprocess.TimeoutExpired:
             last_error = "Download timed out (5 min limit)"
@@ -420,7 +456,7 @@ def run_download(job_id, url, format_choice, format_id):
 
     # All strategies failed
     job["status"] = "error"
-    job["error"] = last_error
+    job["error"] = normalize_ytdlp_error(last_error, youtube)
 
 
 @app.route("/")
@@ -450,7 +486,7 @@ def get_info():
         info = ytdlp_get_info(url)
         return jsonify(info)
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": normalize_ytdlp_error(str(e), is_youtube_url(url))}), 400
 
 
 @app.route("/api/download", methods=["POST"])
@@ -504,6 +540,7 @@ def debug_info():
     data = request.json or {}
     url = data.get("url", "https://www.youtube.com/watch?v=ZtmYzyY9hf0").strip()
     results = {"url": url, "pytubefix_clients": {}, "ytdlp": {}}
+    results["cookie_mode"] = "browser" if COOKIES_FROM_BROWSER else ("file" if os.path.isfile(COOKIES_FILE) else "none")
 
     # Test each pytubefix client
     for client in PYTUBE_CLIENTS:
