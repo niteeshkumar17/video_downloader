@@ -56,6 +56,8 @@ The `Dockerfile` handles everything — Python, ffmpeg, yt-dlp, and gunicorn.
 - Some YouTube videos require a valid logged-in session (cookies).
 - Local run option: set `YTDLP_COOKIES_FROM_BROWSER` (example: `chrome`) so yt-dlp reads cookies from your browser profile.
 - Server option: provide fresh exported cookies via `YTDLP_COOKIES` (base64-encoded `cookies.txt`).
+- Cloud/datacenter note: YouTube may still block requests from some server IP ranges even with cookies.
+- Optional mitigation: set `YTDLP_PROXY` to a trusted residential/ISP proxy endpoint.
 - If you see `Login with OAuth is no longer supported`, refresh/export cookies again and retry.
 - Never commit real cookie files to git.
 

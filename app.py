@@ -23,6 +23,8 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
 COOKIES_FROM_BROWSER = os.environ.get("YTDLP_COOKIES_FROM_BROWSER", "").strip()
+YTDLP_PROXY = os.environ.get("YTDLP_PROXY", "").strip()
+YTDLP_USER_AGENT = os.environ.get("YTDLP_USER_AGENT", "").strip()
 
 # If YTDLP_COOKIES env var is set (base64 encoded cookies.txt), write it to file
 if os.environ.get("YTDLP_COOKIES"):
@@ -36,6 +38,8 @@ if os.environ.get("YTDLP_COOKIES"):
 
 if COOKIES_FROM_BROWSER:
     logger.info(f"Using browser cookies via YTDLP_COOKIES_FROM_BROWSER={COOKIES_FROM_BROWSER}")
+if YTDLP_PROXY:
+    logger.info("Using yt-dlp proxy from YTDLP_PROXY")
 
 
 def get_cookie_args():
@@ -50,6 +54,16 @@ def get_cookie_args():
     if os.path.isfile(COOKIES_FILE):
         return ["--cookies", COOKIES_FILE]
     return []
+
+
+def get_ytdlp_network_args():
+    """Return network-related yt-dlp args from environment."""
+    args = []
+    if YTDLP_PROXY:
+        args += ["--proxy", YTDLP_PROXY]
+    if YTDLP_USER_AGENT:
+        args += ["--user-agent", YTDLP_USER_AGENT]
+    return args
 
 
 def is_youtube_url(url):
@@ -126,7 +140,8 @@ def normalize_ytdlp_error(error_message, is_youtube=False):
             return (
                 "YouTube requires a valid logged-in session for this video. "
                 "Use fresh browser cookies (set YTDLP_COOKIES_FROM_BROWSER=chrome) "
-                "or provide a fresh cookies.txt via YTDLP_COOKIES."
+                "or provide a fresh cookies.txt via YTDLP_COOKIES. "
+                "On cloud/datacenter IPs, YouTube may still block requests; use a residential egress or set YTDLP_PROXY."
             )
 
     return message.split("\n")[-1]
@@ -354,7 +369,7 @@ def ytdlp_get_info(url):
 
     last_error = "Unknown error"
     for extra_args in strategies:
-        cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "-j"] + extra_args + [url]
+        cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "-j"] + get_ytdlp_network_args() + extra_args + [url]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             if result.returncode == 0:
@@ -433,7 +448,7 @@ def run_download(job_id, url, format_choice, format_id):
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
 
     # Build strategy list for yt-dlp
-    base_cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "-o", out_template]
+    base_cmd = ["yt-dlp", "--no-playlist", "--no-warnings"] + get_ytdlp_network_args() + ["-o", out_template]
 
     format_args = []
     if format_choice == "audio":
@@ -585,6 +600,8 @@ def debug_info():
     url = normalize_video_url(data.get("url", "https://www.youtube.com/watch?v=ZtmYzyY9hf0"))
     results = {"url": url, "pytubefix_clients": {}, "ytdlp": {}}
     results["cookie_mode"] = "browser" if COOKIES_FROM_BROWSER else ("file" if os.path.isfile(COOKIES_FILE) else "none")
+    results["proxy_mode"] = "set" if YTDLP_PROXY else "none"
+    results["user_agent_mode"] = "set" if YTDLP_USER_AGENT else "none"
 
     # Test each pytubefix client
     for client in PYTUBE_CLIENTS:
@@ -605,7 +622,7 @@ def debug_info():
             }
 
     # Test yt-dlp
-    cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "-j"] + get_cookie_args() + [url]
+    cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "-j"] + get_ytdlp_network_args() + get_cookie_args() + [url]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
