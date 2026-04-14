@@ -171,13 +171,22 @@ def build_ytdlp_strategies(url):
 
 
 jobs = {}
-preview_lock = threading.Lock()
+preview_jobs = {}
+preview_jobs_lock = threading.Lock()
 PREVIEW_TTL_SECONDS = 1800
+CLEANUP_INTERVAL_SECONDS = 120
+last_cleanup_ts = 0
 
 
-def cleanup_old_files():
-    """Remove downloaded files older than 30 minutes to save disk space on Render."""
-    threshold = time.time() - PREVIEW_TTL_SECONDS
+def cleanup_old_files(force=False):
+    """Remove downloaded files older than TTL; throttled to reduce request latency."""
+    global last_cleanup_ts
+    now = time.time()
+    if not force and (now - last_cleanup_ts) < CLEANUP_INTERVAL_SECONDS:
+        return
+
+    last_cleanup_ts = now
+    threshold = now - PREVIEW_TTL_SECONDS
     for root, _, files in os.walk(DOWNLOAD_DIR):
         for name in files:
             file_path = os.path.join(root, name)
@@ -207,9 +216,33 @@ def preview_assets_exist(preview_id):
     return os.path.isfile(preview_video) and os.path.isfile(preview_thumb)
 
 
-def generate_preview_assets(url):
+def get_preview_payload(preview_id):
+    """Build standard preview response payload."""
+    return {
+        "preview_id": preview_id,
+        "thumbnail": f"/api/preview/thumb/{preview_id}",
+        "preview_video": f"/api/preview/video/{preview_id}",
+    }
+
+
+def get_preview_job(preview_id):
+    """Read preview job metadata in a thread-safe way."""
+    with preview_jobs_lock:
+        return preview_jobs.get(preview_id)
+
+
+def set_preview_job(preview_id, status, error=None):
+    """Update preview job metadata in a thread-safe way."""
+    with preview_jobs_lock:
+        preview_jobs[preview_id] = {
+            "status": status,
+            "error": error,
+            "updated_at": time.time(),
+        }
+
+
+def generate_preview_assets(preview_id, url):
     """Generate a 5 second preview clip and thumbnail for a video URL."""
-    preview_id = get_preview_id(url)
     preview_video, preview_thumb = get_preview_paths(preview_id)
     raw_template = os.path.join(PREVIEW_DIR, f"{preview_id}_raw.%(ext)s")
     raw_pattern = os.path.join(PREVIEW_DIR, f"{preview_id}_raw.*")
@@ -217,91 +250,107 @@ def generate_preview_assets(url):
     if preview_assets_exist(preview_id):
         return preview_id
 
-    with preview_lock:
-        if preview_assets_exist(preview_id):
-            return preview_id
+    youtube = is_youtube_url(url)
+    last_error = "Unable to fetch preview media"
 
-        youtube = is_youtube_url(url)
-        last_error = "Unable to fetch preview media"
-
-        for old_raw in glob.glob(raw_pattern):
-            try:
-                os.remove(old_raw)
-            except OSError:
-                pass
-
+    for old_raw in glob.glob(raw_pattern):
         try:
-            strategies = build_ytdlp_strategies(url)
-            for extra_args in strategies:
-                cmd = [
-                    "yt-dlp",
-                    "--no-playlist",
-                    "--no-warnings",
-                    "--force-overwrites",
-                    "--download-sections", "*0-5",
-                    "-f", "best[ext=mp4][height<=480]/best[height<=480]/best[ext=mp4]/best",
-                    "-o", raw_template,
-                ] + get_ytdlp_network_args() + extra_args + [url]
+            os.remove(old_raw)
+        except OSError:
+            pass
 
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-                if result.returncode == 0:
-                    break
+    try:
+        strategies = build_ytdlp_strategies(url)
+        for extra_args in strategies:
+            cmd = [
+                "yt-dlp",
+                "--no-playlist",
+                "--no-warnings",
+                "--force-overwrites",
+                "--download-sections", "*0-5",
+                "-f", "best[ext=mp4][height<=360]/best[height<=360]/best[ext=mp4]/best",
+                "-o", raw_template,
+            ] + get_ytdlp_network_args() + extra_args + [url]
 
-                stderr = (result.stderr or result.stdout or "").strip()
-                last_error = normalize_ytdlp_error(stderr, youtube)
-            else:
-                raise Exception(last_error)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode == 0:
+                break
 
-            raw_files = glob.glob(raw_pattern)
-            if not raw_files:
-                raise Exception("Preview download did not produce a file")
-            raw_file = raw_files[0]
+            stderr = (result.stderr or result.stdout or "").strip()
+            last_error = normalize_ytdlp_error(stderr, youtube)
+        else:
+            raise Exception(last_error)
 
+        raw_files = glob.glob(raw_pattern)
+        if not raw_files:
+            raise Exception("Preview download did not produce a file")
+        raw_file = raw_files[0]
+
+        raw_ext = os.path.splitext(raw_file)[1].lower()
+        if raw_ext == ".mp4":
+            try:
+                if os.path.isfile(preview_video):
+                    os.remove(preview_video)
+                os.replace(raw_file, preview_video)
+            except OSError as e:
+                raise Exception(f"Failed to store preview video: {e}")
+        else:
             clip_cmd = [
                 "ffmpeg", "-y",
                 "-i", raw_file,
                 "-t", "5",
-                "-vf", "scale='min(720,iw)':-2",
+                "-vf", "scale='min(640,iw)':-2",
                 "-c:v", "libx264",
                 "-preset", "veryfast",
                 "-movflags", "+faststart",
                 "-an",
                 preview_video,
             ]
-            clip_result = subprocess.run(clip_cmd, capture_output=True, text=True, timeout=120)
+            clip_result = subprocess.run(clip_cmd, capture_output=True, text=True, timeout=90)
             if clip_result.returncode != 0:
                 raise Exception("Failed to create preview video")
 
-            thumb_cmd = [
-                "ffmpeg", "-y",
-                "-ss", "1",
-                "-i", preview_video,
-                "-frames:v", "1",
-                "-q:v", "3",
-                preview_thumb,
-            ]
-            thumb_result = subprocess.run(thumb_cmd, capture_output=True, text=True, timeout=60)
-            if thumb_result.returncode != 0:
-                raise Exception("Failed to create preview thumbnail")
+        thumb_cmd = [
+            "ffmpeg", "-y",
+            "-ss", "0.8",
+            "-i", preview_video,
+            "-frames:v", "1",
+            "-q:v", "4",
+            preview_thumb,
+        ]
+        thumb_result = subprocess.run(thumb_cmd, capture_output=True, text=True, timeout=45)
+        if thumb_result.returncode != 0:
+            raise Exception("Failed to create preview thumbnail")
 
-            if not preview_assets_exist(preview_id):
-                raise Exception("Preview assets are incomplete")
-        except Exception:
-            for path in [preview_video, preview_thumb]:
-                try:
-                    if os.path.isfile(path):
-                        os.remove(path)
-                except OSError:
-                    pass
-            raise
-        finally:
-            for raw_file in glob.glob(raw_pattern):
-                try:
-                    os.remove(raw_file)
-                except OSError:
-                    pass
+        if not preview_assets_exist(preview_id):
+            raise Exception("Preview assets are incomplete")
+    except Exception:
+        for path in [preview_video, preview_thumb]:
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except OSError:
+                pass
+        raise
+    finally:
+        for raw_file in glob.glob(raw_pattern):
+            try:
+                os.remove(raw_file)
+            except OSError:
+                pass
 
     return preview_id
+
+
+def generate_preview_assets_job(preview_id, url):
+    """Background task that generates preview assets and updates job state."""
+    try:
+        generate_preview_assets(preview_id, url)
+        set_preview_job(preview_id, "done")
+    except Exception as e:
+        normalized_error = normalize_ytdlp_error(str(e), is_youtube_url(url))
+        logger.warning(f"Preview generation failed for {url}: {normalized_error}")
+        set_preview_job(preview_id, "error", normalized_error)
 
 
 def is_valid_preview_id(preview_id):
@@ -689,7 +738,7 @@ def get_info():
 
 @app.route("/api/preview", methods=["POST"])
 def get_preview():
-    """Generate or fetch cached fallback preview assets for a URL."""
+    """Kick off preview generation and return quickly for instant-feel UI."""
     cleanup_old_files()
 
     data = request.json or {}
@@ -697,15 +746,48 @@ def get_preview():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    try:
-        preview_id = generate_preview_assets(url)
-        return jsonify({
-            "thumbnail": f"/api/preview/thumb/{preview_id}",
-            "preview_video": f"/api/preview/video/{preview_id}",
-        })
-    except Exception as e:
-        logger.warning(f"Preview generation failed for {url}: {e}")
-        return jsonify({"error": normalize_ytdlp_error(str(e), is_youtube_url(url))}), 400
+    preview_id = get_preview_id(url)
+    payload = get_preview_payload(preview_id)
+
+    if preview_assets_exist(preview_id):
+        return jsonify({"status": "ready", **payload})
+
+    should_start_job = False
+    with preview_jobs_lock:
+        existing_job = preview_jobs.get(preview_id)
+        if not existing_job or existing_job.get("status") != "processing":
+            preview_jobs[preview_id] = {
+                "status": "processing",
+                "error": None,
+                "updated_at": time.time(),
+            }
+            should_start_job = True
+
+    if should_start_job:
+        thread = threading.Thread(target=generate_preview_assets_job, args=(preview_id, url), daemon=True)
+        thread.start()
+
+    return jsonify({"status": "processing", **payload})
+
+
+@app.route("/api/preview/status/<preview_id>")
+def get_preview_status(preview_id):
+    if not is_valid_preview_id(preview_id):
+        return jsonify({"error": "Invalid preview id"}), 400
+
+    payload = get_preview_payload(preview_id)
+
+    if preview_assets_exist(preview_id):
+        return jsonify({"status": "ready", **payload})
+
+    job = get_preview_job(preview_id)
+    if not job:
+        return jsonify({"status": "not-found", **payload})
+
+    if job.get("status") == "error":
+        return jsonify({"status": "error", "error": job.get("error"), **payload})
+
+    return jsonify({"status": "processing", **payload})
 
 
 @app.route("/api/preview/video/<preview_id>")
