@@ -12,7 +12,7 @@ import time
 import random
 from urllib.parse import parse_qs, urlparse, quote
 import requests
-from flask import Flask, request, jsonify, send_file, render_template
+from flask import Flask, request, jsonify, send_file, render_template, redirect
 from flask_cors import CORS
 
 # Configure logging
@@ -38,7 +38,22 @@ TERABOX_USER_AGENT = (
     or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
-TERABOX_HOST_HINTS = ("terabox.com", "terabox.app", "1024terabox.com", "nephobox.com")
+TERABOX_HOST_HINTS = (
+    "terabox.com",
+    "terabox.app",
+    "1024terabox.com",
+    "1024tera.com",
+    "nephobox.com",
+)
+
+
+class TeraboxExternalDownloadRequired(Exception):
+    """Raised when Terabox blocks server-side download but browser-session download may still work."""
+
+    def __init__(self, dlink, filename):
+        super().__init__("Terabox requires browser-session download")
+        self.dlink = dlink
+        self.filename = filename
 
 # If YTDLP_COOKIES env var is set (base64 encoded cookies.txt), write it to file
 if os.environ.get("YTDLP_COOKIES"):
@@ -131,11 +146,13 @@ def normalize_video_url(url):
         host = (parsed.netloc or "").lower()
         path = parsed.path or ""
 
-        # Terabox variants -> canonical share URL
+        # Terabox variants -> canonical share URL on the same host
         if any(hint in host for hint in TERABOX_HOST_HINTS):
             surl = extract_terabox_surl(url)
             if surl:
-                return f"https://www.terabox.com/sharing/link?surl={quote(surl, safe='')}"
+                scheme = parsed.scheme if parsed.scheme in ("http", "https") else "https"
+                canonical_host = parsed.netloc or "www.terabox.com"
+                return f"{scheme}://{canonical_host}/sharing/link?surl={quote(surl, safe='')}"
 
         # youtu.be/<id> -> youtube watch URL
         if "youtu.be" in host:
@@ -197,31 +214,41 @@ def normalize_ytdlp_error(error_message, is_youtube=False):
 
 def parse_netscape_cookie_header(cookie_file, domain_hints):
     """Read Netscape cookie file and return Cookie header string for matching domains."""
-    cookies = {}
     if not os.path.isfile(cookie_file):
         return ""
 
     try:
         with open(cookie_file, "r", encoding="utf-8", errors="ignore") as f:
-            for raw_line in f:
-                line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
-
-                parts = line.split("\t")
-                if len(parts) < 7:
-                    continue
-
-                domain = (parts[0] or "").lower()
-                if not any(hint in domain for hint in domain_hints):
-                    continue
-
-                name = parts[5].strip()
-                value = parts[6].strip()
-                if name:
-                    cookies[name] = value
+            content = f.read()
     except OSError:
         return ""
+
+    return parse_netscape_cookie_text(content, domain_hints)
+
+
+def parse_netscape_cookie_text(cookie_text, domain_hints):
+    """Parse Netscape cookie content and return Cookie header string."""
+    cookies = {}
+    if not cookie_text:
+        return ""
+
+    for raw_line in cookie_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+
+        domain = (parts[0] or "").lower()
+        if not any(hint in domain for hint in domain_hints):
+            continue
+
+        name = parts[5].strip()
+        value = parts[6].strip()
+        if name:
+            cookies[name] = value
 
     if not cookies:
         return ""
@@ -231,6 +258,10 @@ def parse_netscape_cookie_header(cookie_file, domain_hints):
 def get_terabox_cookie_header():
     """Return Terabox cookie header from env/file/cookies.txt."""
     if TERABOX_COOKIE:
+        # TERABOX_COOKIE can be either a header string or Netscape content.
+        parsed = parse_netscape_cookie_text(TERABOX_COOKIE, TERABOX_HOST_HINTS)
+        if parsed:
+            return parsed
         return TERABOX_COOKIE
 
     if os.path.isfile(TERABOX_COOKIE_FILE):
@@ -238,11 +269,27 @@ def get_terabox_cookie_header():
             with open(TERABOX_COOKIE_FILE, "r", encoding="utf-8", errors="ignore") as f:
                 value = f.read().strip()
             if value:
+                parsed = parse_netscape_cookie_text(value, TERABOX_HOST_HINTS)
+                if parsed:
+                    return parsed
                 return value
         except OSError:
             pass
 
-    return parse_netscape_cookie_header(COOKIES_FILE, TERABOX_HOST_HINTS)
+    # Try the default cookies file first.
+    parsed_default = parse_netscape_cookie_header(COOKIES_FILE, TERABOX_HOST_HINTS)
+    if parsed_default:
+        return parsed_default
+
+    # Auto-discover commonly exported Terabox cookie files in project folder.
+    project_dir = os.path.dirname(__file__)
+    for pattern in ("*terabox*cookies*.txt", "*1024terabox*cookies*.txt"):
+        for candidate in glob.glob(os.path.join(project_dir, pattern)):
+            parsed = parse_netscape_cookie_header(candidate, TERABOX_HOST_HINTS)
+            if parsed:
+                return parsed
+
+    return ""
 
 
 def build_terabox_dp_logid(uk=None, client=""):
@@ -295,11 +342,33 @@ def normalize_terabox_error(error_data):
             "Terabox requires verification for this link right now. "
             "Add a logged-in Terabox cookie via TERABOX_COOKIE or terabox_cookies.txt and retry."
         )
+    if code == 400141:
+        return (
+            "This Terabox/1024tera share currently requires verification or an extraction code. "
+            "Open the link in browser, complete verification (and code if prompted), then export fresh cookies and retry."
+        )
     if code in (105, 2):
         return "This Terabox link looks invalid, expired, or protected."
     if msg:
         return f"Terabox error: {msg}"
     return "Failed to fetch Terabox file info"
+
+
+def terabox_is_dir(value):
+    """Normalize various isdir value encodings used by Terabox APIs."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes")
+    return bool(value)
+
+
+def is_terabox_family_host(host):
+    """Return True when host belongs to Terabox/1024tera family."""
+    host = (host or "").lower()
+    return any(hint in host for hint in TERABOX_HOST_HINTS)
 
 
 def pick_terabox_file(items):
@@ -308,17 +377,114 @@ def pick_terabox_file(items):
         return None
 
     for item in items:
-        if not item.get("isdir"):
+        if not terabox_is_dir(item.get("isdir")):
             return item
 
     for item in items:
         children = item.get("children")
         if isinstance(children, list):
             for child in children:
-                if not child.get("isdir"):
+                if not terabox_is_dir(child.get("isdir")):
                     return child
 
     return None
+
+
+def resolve_terabox_dlink(session, hosts_to_try, base_api_params, api_headers, surl, fs_id):
+    """Resolve direct download link via shorturlinfo + sharedownload."""
+    if not fs_id:
+        raise Exception("Terabox file id is missing")
+
+    fs_id_str = str(fs_id)
+    shorturl_candidates = [surl]
+    if surl and not surl.startswith("1"):
+        shorturl_candidates.append(f"1{surl}")
+
+    short_data = None
+    last_error_data = None
+    last_network_error = None
+
+    # Step 1: get sign/timestamp/shareid from shorturlinfo.
+    for host in hosts_to_try:
+        for shorturl_value in shorturl_candidates:
+            params = dict(base_api_params)
+            params.update({"shorturl": shorturl_value})
+            req_headers = dict(api_headers)
+            req_headers["Origin"] = f"https://{host}"
+
+            try:
+                rr = session.get(f"https://{host}/api/shorturlinfo", params=params, headers=req_headers, timeout=30)
+                data = rr.json()
+            except requests.RequestException as e:
+                last_network_error = e
+                continue
+            except ValueError:
+                continue
+
+            last_error_data = data
+
+            share_id = data.get("shareid") or data.get("share_id")
+            uk = data.get("uk")
+            sign = data.get("sign")
+            timestamp = data.get("timestamp")
+
+            # errno -3 also returns usable fields for share download flow.
+            if share_id and uk and sign and timestamp:
+                short_data = {
+                    "share_id": str(share_id),
+                    "uk": str(uk),
+                    "sign": str(sign),
+                    "timestamp": str(timestamp),
+                }
+                break
+
+        if short_data:
+            break
+
+    if not short_data:
+        if not last_error_data and last_network_error:
+            raise Exception(f"Terabox network error: {last_network_error}")
+        raise Exception(normalize_terabox_error(last_error_data))
+
+    # Step 2: request sharedownload with discovered signature fields.
+    download_params = dict(base_api_params)
+    download_params.update({
+        "fid_list": f"[{fs_id_str}]",
+        "primaryid": short_data["share_id"],
+        "uk": short_data["uk"],
+        "sign": short_data["sign"],
+        "timestamp": short_data["timestamp"],
+        "product": "share",
+    })
+
+    for host in hosts_to_try:
+        req_headers = dict(api_headers)
+        req_headers["Origin"] = f"https://{host}"
+
+        try:
+            rr = session.get(
+                f"https://{host}/api/sharedownload",
+                params=download_params,
+                headers=req_headers,
+                timeout=30,
+            )
+            data = rr.json()
+        except requests.RequestException as e:
+            last_network_error = e
+            continue
+        except ValueError:
+            continue
+
+        last_error_data = data
+        if data.get("errno") == 0 and isinstance(data.get("list"), list) and data.get("list"):
+            for item in data.get("list") or []:
+                dlink = item.get("dlink") or item.get("downloadlink") or item.get("download_link")
+                if dlink:
+                    return dlink
+
+    if not last_error_data and last_network_error:
+        raise Exception(f"Terabox network error: {last_network_error}")
+    raise Exception(normalize_terabox_error(last_error_data))
 
 
 def terabox_get_info(url):
@@ -328,6 +494,31 @@ def terabox_get_info(url):
     if not surl:
         raise Exception("Invalid Terabox share URL")
 
+    parsed_input = urlparse(normalized_url)
+    input_scheme = parsed_input.scheme if parsed_input.scheme in ("http", "https") else "https"
+    input_host = (parsed_input.netloc or "").lower()
+    input_origin = f"{input_scheme}://{input_host}" if input_host else "https://www.terabox.com"
+
+    hosts_to_try = []
+
+    def add_host(host):
+        h = (host or "").strip().lower()
+        if h and h not in hosts_to_try:
+            hosts_to_try.append(h)
+
+    add_host(input_host)
+    for host in (
+        "www.terabox.com",
+        "www.terabox.app",
+        "dm.1024terabox.com",
+        "www.1024terabox.com",
+        "1024terabox.com",
+        "dm.1024tera.com",
+        "www.1024tera.com",
+        "1024tera.com",
+    ):
+        add_host(host)
+
     cookie_header = get_terabox_cookie_header()
 
     session = requests.Session()
@@ -335,13 +526,22 @@ def terabox_get_info(url):
         "User-Agent": TERABOX_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.terabox.com/",
+        "Referer": f"{input_origin}/",
     }
     if cookie_header:
         share_headers["Cookie"] = cookie_header
 
     share_resp = session.get(normalized_url, headers=share_headers, timeout=30, allow_redirects=True)
     share_resp.raise_for_status()
+
+    parsed_share = urlparse(share_resp.url)
+    share_scheme = parsed_share.scheme if parsed_share.scheme in ("http", "https") else "https"
+    share_host = (parsed_share.netloc or "").lower()
+    share_origin = f"{share_scheme}://{share_host}" if share_host else input_origin
+    if share_host:
+        if share_host in hosts_to_try:
+            hosts_to_try.remove(share_host)
+        hosts_to_try.insert(0, share_host)
 
     html = share_resp.text or ""
     js_token = extract_terabox_js_token(html)
@@ -375,7 +575,7 @@ def terabox_get_info(url):
         "User-Agent": TERABOX_USER_AGENT,
         "Accept": "application/json,text/plain,*/*",
         "Referer": share_resp.url,
-        "Origin": "https://www.terabox.com",
+        "Origin": share_origin,
         "X-Requested-With": "XMLHttpRequest",
     }
     if cookie_header:
@@ -383,9 +583,14 @@ def terabox_get_info(url):
 
     list_response = None
     last_error_data = None
-    for host in ("www.terabox.com", "www.terabox.app"):
+    last_network_error = None
+    for host in hosts_to_try:
         endpoint = f"https://{host}/share/list"
-        r = session.get(endpoint, params=list_params, headers=api_headers, timeout=30)
+        try:
+            r = session.get(endpoint, params=list_params, headers=api_headers, timeout=30)
+        except requests.RequestException as e:
+            last_network_error = e
+            continue
         try:
             data = r.json()
         except ValueError:
@@ -408,9 +613,13 @@ def terabox_get_info(url):
             "shorturl": surl,
             "surl": surl,
         }
-        for host in ("www.terabox.com", "www.terabox.app"):
+        for host in hosts_to_try:
             endpoint = f"https://{host}/api/shorturlinfo"
-            r = session.get(endpoint, params=short_params, headers=api_headers, timeout=20)
+            try:
+                r = session.get(endpoint, params=short_params, headers=api_headers, timeout=20)
+            except requests.RequestException as e:
+                last_network_error = e
+                continue
             try:
                 data = r.json()
             except ValueError:
@@ -419,15 +628,34 @@ def terabox_get_info(url):
             if data.get("errno") == 0 or data.get("code") == 0:
                 break
 
+        if not last_error_data and last_network_error:
+            raise Exception(f"Terabox network error: {last_network_error}")
+
         raise Exception(normalize_terabox_error(last_error_data))
 
     file_item = pick_terabox_file(list_response.get("list") or [])
     if not file_item:
         raise Exception("No downloadable file found in this Terabox share")
 
+    # Some Terabox/1024tera hosts omit dlink in /share/list and require /api/sharedownload.
     dlink = file_item.get("dlink") or ""
     if not dlink:
-        raise Exception("Terabox did not return a direct download URL for this file")
+        base_api_params = {
+            "app_id": "250528",
+            "web": "1",
+            "channel": "dubox",
+            "clienttype": "0",
+            "jsToken": js_token,
+            "dp-logid": dp_logid,
+        }
+        dlink = resolve_terabox_dlink(
+            session=session,
+            hosts_to_try=hosts_to_try,
+            base_api_params=base_api_params,
+            api_headers=api_headers,
+            surl=surl,
+            fs_id=file_item.get("fs_id"),
+        )
 
     file_name = file_item.get("server_filename") or "terabox_file"
     thumbs = file_item.get("thumbs") or {}
@@ -469,7 +697,24 @@ def terabox_download(job_id, url, format_choice):
         headers["Cookie"] = cookie_header
 
     with requests.get(dlink, headers=headers, stream=True, timeout=90, allow_redirects=True) as r:
+        response_host = (urlparse(r.url or dlink).netloc or "").lower()
+        is_terabox_host = is_terabox_family_host(response_host)
+
         if r.status_code >= 400:
+            error_text = ""
+            try:
+                error_text = (r.text or "")[:500]
+            except Exception:
+                error_text = ""
+
+            # d.* endpoints may reject server-side requests while browser-session download still works.
+            is_user_not_exists = (
+                ("error_code" in error_text and "31045" in error_text)
+                or "user not exists" in error_text.lower()
+            )
+            if r.status_code in (401, 403) and (is_user_not_exists or is_terabox_host):
+                raise TeraboxExternalDownloadRequired(dlink=dlink, filename=original_name)
+
             raise Exception(f"Terabox download failed (HTTP {r.status_code})")
 
         with open(temp_path, "wb") as f:
@@ -953,6 +1198,23 @@ def run_download(job_id, url, format_choice, format_id):
 
             logger.info(f"[{job_id}] Terabox direct download successful")
             return
+        except TeraboxExternalDownloadRequired as e:
+            logger.info(f"[{job_id}] Falling back to browser-session Terabox download")
+            job["status"] = "done"
+            job["external_url"] = e.dlink
+
+            ext = os.path.splitext(e.filename or "")[1]
+            if not ext:
+                ext = ".mp4" if format_choice != "audio" else ".mp3"
+
+            title = job.get("title", "").strip()
+            if title:
+                safe_title = "".join(c for c in title if c not in r'\\/:*?"<>|').strip()[:80].strip()
+                job["filename"] = f"{safe_title}{ext}" if safe_title else (e.filename or f"download{ext}")
+            else:
+                cleaned = "".join(c for c in (e.filename or "") if c not in r'\\/:*?"<>|').strip()
+                job["filename"] = cleaned or f"download{ext}"
+            return
         except Exception as e:
             logger.warning(f"[{job_id}] Terabox direct download failed: {e}")
             job["status"] = "error"
@@ -1223,6 +1485,7 @@ def check_status(job_id):
         "status": job["status"],
         "error": job.get("error"),
         "filename": job.get("filename"),
+        "external_url": job.get("external_url"),
     })
 
 
@@ -1231,6 +1494,8 @@ def download_file(job_id):
     job = jobs.get(job_id)
     if not job or job["status"] != "done":
         return jsonify({"error": "File not ready"}), 404
+    if job.get("external_url"):
+        return redirect(job["external_url"], code=302)
     return send_file(job["file"], as_attachment=True, download_name=job["filename"])
 
 

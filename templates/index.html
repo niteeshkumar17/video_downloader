@@ -1138,6 +1138,7 @@
             clearInterval(iv);
             c.status = 'done';
             c.filename = data.filename;
+            c.externalUrl = data.external_url || '';
             renderCard(idx);
             saveCard(idx);
           } else if (data.status === 'error') {
@@ -1158,10 +1159,17 @@
     function saveCard(idx) {
       const c = cardData[idx];
       if (!c.jobId) return;
+
+      const href = c.externalUrl || `/api/file/${c.jobId}`;
       const a = document.createElement('a');
-      a.href = `/api/file/${c.jobId}`;
-      a.download = c.filename || '';
+      a.href = href;
+      if (!c.externalUrl) {
+        a.download = c.filename || '';
+      }
+      a.rel = 'noopener';
+      document.body.appendChild(a);
       a.click();
+      a.remove();
     }
 
     async function dlAll() {
