@@ -9,7 +9,9 @@ import threading
 import base64
 import logging
 import time
-from urllib.parse import parse_qs, urlparse
+import random
+from urllib.parse import parse_qs, urlparse, quote
+import requests
 from flask import Flask, request, jsonify, send_file, render_template
 from flask_cors import CORS
 
@@ -29,6 +31,14 @@ COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
 COOKIES_FROM_BROWSER = os.environ.get("YTDLP_COOKIES_FROM_BROWSER", "").strip()
 YTDLP_PROXY = os.environ.get("YTDLP_PROXY", "").strip()
 YTDLP_USER_AGENT = os.environ.get("YTDLP_USER_AGENT", "").strip()
+TERABOX_COOKIE_FILE = os.path.join(os.path.dirname(__file__), "terabox_cookies.txt")
+TERABOX_COOKIE = os.environ.get("TERABOX_COOKIE", "").strip()
+TERABOX_USER_AGENT = (
+    os.environ.get("TERABOX_USER_AGENT", "").strip()
+    or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+TERABOX_HOST_HINTS = ("terabox.com", "terabox.app", "1024terabox.com", "nephobox.com")
 
 # If YTDLP_COOKIES env var is set (base64 encoded cookies.txt), write it to file
 if os.environ.get("YTDLP_COOKIES"):
@@ -82,6 +92,34 @@ def is_youtube_url(url):
     return any(re.match(pattern, url) for pattern in youtube_patterns)
 
 
+def is_terabox_url(url):
+    """Check if a URL belongs to Terabox-like share domains."""
+    try:
+        host = (urlparse(url).netloc or "").lower()
+    except Exception:
+        return False
+    return any(domain in host for domain in TERABOX_HOST_HINTS)
+
+
+def extract_terabox_surl(url):
+    """Extract surl token from Terabox-style links."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return ""
+
+    qs = parse_qs(parsed.query or "")
+    surl = (qs.get("surl") or qs.get("shorturl") or [""])[0].strip()
+    if surl:
+        return surl
+
+    path = parsed.path or ""
+    m = re.search(r"/s/([^/?#]+)", path)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
 def normalize_video_url(url):
     """Normalize known URL variants to improve extractor compatibility."""
     url = (url or "").strip()
@@ -92,6 +130,12 @@ def normalize_video_url(url):
         parsed = urlparse(url)
         host = (parsed.netloc or "").lower()
         path = parsed.path or ""
+
+        # Terabox variants -> canonical share URL
+        if any(hint in host for hint in TERABOX_HOST_HINTS):
+            surl = extract_terabox_surl(url)
+            if surl:
+                return f"https://www.terabox.com/sharing/link?surl={quote(surl, safe='')}"
 
         # youtu.be/<id> -> youtube watch URL
         if "youtu.be" in host:
@@ -149,6 +193,304 @@ def normalize_ytdlp_error(error_message, is_youtube=False):
             )
 
     return message.split("\n")[-1]
+
+
+def parse_netscape_cookie_header(cookie_file, domain_hints):
+    """Read Netscape cookie file and return Cookie header string for matching domains."""
+    cookies = {}
+    if not os.path.isfile(cookie_file):
+        return ""
+
+    try:
+        with open(cookie_file, "r", encoding="utf-8", errors="ignore") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                parts = line.split("\t")
+                if len(parts) < 7:
+                    continue
+
+                domain = (parts[0] or "").lower()
+                if not any(hint in domain for hint in domain_hints):
+                    continue
+
+                name = parts[5].strip()
+                value = parts[6].strip()
+                if name:
+                    cookies[name] = value
+    except OSError:
+        return ""
+
+    if not cookies:
+        return ""
+    return "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+
+def get_terabox_cookie_header():
+    """Return Terabox cookie header from env/file/cookies.txt."""
+    if TERABOX_COOKIE:
+        return TERABOX_COOKIE
+
+    if os.path.isfile(TERABOX_COOKIE_FILE):
+        try:
+            with open(TERABOX_COOKIE_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                value = f.read().strip()
+            if value:
+                return value
+        except OSError:
+            pass
+
+    return parse_netscape_cookie_header(COOKIES_FILE, TERABOX_HOST_HINTS)
+
+
+def build_terabox_dp_logid(uk=None, client=""):
+    """Build dp-logid value similar to Terabox's dplogid script."""
+    session_id = random.randint(100000, 999999)
+    if uk and re.fullmatch(r"\d{10}", str(uk)):
+        user_id = str(uk)
+    else:
+        user_id = f"00{random.randint(10000000, 99999999)}"
+    return f"{client}{session_id}{user_id}0001"
+
+
+def extract_terabox_template_data(html):
+    """Extract templateData JSON blob from share page."""
+    m = re.search(r"var\s+templateData\s*=\s*(\{.*?\});\s*</script>", html or "", re.S)
+    if not m:
+        return {}
+
+    try:
+        return json.loads(m.group(1))
+    except Exception:
+        return {}
+
+
+def extract_terabox_js_token(html):
+    """Extract jsToken from encoded inline script."""
+    html = html or ""
+    m = re.search(r"fn%28%22([A-F0-9]+)%22%29", html)
+    if m:
+        return m.group(1)
+
+    m = re.search(r"window\.jsToken\s*=\s*\"([A-F0-9]+)\"", html)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def normalize_terabox_error(error_data):
+    """Map Terabox API errors into short actionable messages."""
+    if not isinstance(error_data, dict):
+        return "Unable to read Terabox response"
+
+    code = error_data.get("errno")
+    if code is None:
+        code = error_data.get("code")
+    msg = (error_data.get("errmsg") or "").strip()
+
+    if code in (460020, 400210):
+        return (
+            "Terabox requires verification for this link right now. "
+            "Add a logged-in Terabox cookie via TERABOX_COOKIE or terabox_cookies.txt and retry."
+        )
+    if code in (105, 2):
+        return "This Terabox link looks invalid, expired, or protected."
+    if msg:
+        return f"Terabox error: {msg}"
+    return "Failed to fetch Terabox file info"
+
+
+def pick_terabox_file(items):
+    """Pick a downloadable file from Terabox list response."""
+    if not isinstance(items, list) or not items:
+        return None
+
+    for item in items:
+        if not item.get("isdir"):
+            return item
+
+    for item in items:
+        children = item.get("children")
+        if isinstance(children, list):
+            for child in children:
+                if not child.get("isdir"):
+                    return child
+
+    return None
+
+
+def terabox_get_info(url):
+    """Fetch Terabox info using its web APIs."""
+    normalized_url = normalize_video_url(url)
+    surl = extract_terabox_surl(normalized_url)
+    if not surl:
+        raise Exception("Invalid Terabox share URL")
+
+    cookie_header = get_terabox_cookie_header()
+
+    session = requests.Session()
+    share_headers = {
+        "User-Agent": TERABOX_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.terabox.com/",
+    }
+    if cookie_header:
+        share_headers["Cookie"] = cookie_header
+
+    share_resp = session.get(normalized_url, headers=share_headers, timeout=30, allow_redirects=True)
+    share_resp.raise_for_status()
+
+    html = share_resp.text or ""
+    js_token = extract_terabox_js_token(html)
+    if not js_token:
+        raise Exception("Could not read Terabox access token from share page")
+
+    template_data = extract_terabox_template_data(html)
+    uk = template_data.get("uk")
+    bdstoken = template_data.get("bdstoken")
+    dp_logid = build_terabox_dp_logid(uk=uk)
+
+    list_params = {
+        "app_id": "250528",
+        "web": "1",
+        "channel": "dubox",
+        "clienttype": "0",
+        "jsToken": js_token,
+        "dp-logid": dp_logid,
+        "page": "1",
+        "num": "20",
+        "by": "name",
+        "order": "asc",
+        "site_referer": share_resp.url,
+        "shorturl": surl,
+        "root": "1",
+    }
+    if bdstoken:
+        list_params["bdstoken"] = str(bdstoken)
+
+    api_headers = {
+        "User-Agent": TERABOX_USER_AGENT,
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": share_resp.url,
+        "Origin": "https://www.terabox.com",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    if cookie_header:
+        api_headers["Cookie"] = cookie_header
+
+    list_response = None
+    last_error_data = None
+    for host in ("www.terabox.com", "www.terabox.app"):
+        endpoint = f"https://{host}/share/list"
+        r = session.get(endpoint, params=list_params, headers=api_headers, timeout=30)
+        try:
+            data = r.json()
+        except ValueError:
+            continue
+
+        if data.get("errno") == 0 and isinstance(data.get("list"), list) and data.get("list"):
+            list_response = data
+            break
+        last_error_data = data
+
+    # Fallback call for clearer verification/private-link errors.
+    if not list_response:
+        short_params = {
+            "app_id": "250528",
+            "web": "1",
+            "channel": "dubox",
+            "clienttype": "0",
+            "jsToken": js_token,
+            "dp-logid": dp_logid,
+            "shorturl": surl,
+            "surl": surl,
+        }
+        for host in ("www.terabox.com", "www.terabox.app"):
+            endpoint = f"https://{host}/api/shorturlinfo"
+            r = session.get(endpoint, params=short_params, headers=api_headers, timeout=20)
+            try:
+                data = r.json()
+            except ValueError:
+                continue
+            last_error_data = data
+            if data.get("errno") == 0 or data.get("code") == 0:
+                break
+
+        raise Exception(normalize_terabox_error(last_error_data))
+
+    file_item = pick_terabox_file(list_response.get("list") or [])
+    if not file_item:
+        raise Exception("No downloadable file found in this Terabox share")
+
+    dlink = file_item.get("dlink") or ""
+    if not dlink:
+        raise Exception("Terabox did not return a direct download URL for this file")
+
+    file_name = file_item.get("server_filename") or "terabox_file"
+    thumbs = file_item.get("thumbs") or {}
+    thumbnail = thumbs.get("url3") or thumbs.get("url2") or thumbs.get("url1") or ""
+
+    return {
+        "title": file_name,
+        "thumbnail": thumbnail,
+        "duration": None,
+        "uploader": "Terabox",
+        "formats": [{"id": "terabox_direct", "label": "Original", "height": 1}],
+        "terabox_dlink": dlink,
+        "terabox_filename": file_name,
+        "terabox_referer": share_resp.url,
+    }
+
+
+def terabox_download(job_id, url, format_choice):
+    """Download file directly from Terabox dlink."""
+    info = terabox_get_info(url)
+    dlink = info.get("terabox_dlink")
+    if not dlink:
+        raise Exception("Terabox direct link is missing")
+
+    original_name = (info.get("terabox_filename") or info.get("title") or "terabox_file").strip()
+    ext = os.path.splitext(original_name)[1].lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,6}", ext or ""):
+        ext = ".mp4"
+
+    temp_path = os.path.join(DOWNLOAD_DIR, f"{job_id}{ext}")
+    final_path = temp_path
+
+    headers = {
+        "User-Agent": TERABOX_USER_AGENT,
+        "Referer": info.get("terabox_referer") or normalize_video_url(url),
+    }
+    cookie_header = get_terabox_cookie_header()
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+
+    with requests.get(dlink, headers=headers, stream=True, timeout=90, allow_redirects=True) as r:
+        if r.status_code >= 400:
+            raise Exception(f"Terabox download failed (HTTP {r.status_code})")
+
+        with open(temp_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
+
+    if format_choice == "audio":
+        mp3_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp3")
+        cmd = ["ffmpeg", "-y", "-i", temp_path, "-vn", "-acodec", "libmp3lame", "-ab", "192k", mp3_path]
+        convert = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if convert.returncode != 0:
+            raise Exception("Failed to convert Terabox file to MP3")
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        final_path = mp3_path
+        original_name = f"{os.path.splitext(original_name)[0] or 'audio'}.mp3"
+
+    return final_path, original_name
 
 
 def build_ytdlp_strategies(url):
@@ -592,6 +934,31 @@ def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
     youtube = is_youtube_url(url)
 
+    # ── Terabox direct flow ──────────────────────────────────────────────────
+    if is_terabox_url(url):
+        try:
+            logger.info(f"[{job_id}] Attempting Terabox direct download")
+            filepath, original_name = terabox_download(job_id, url, format_choice)
+            job["status"] = "done"
+            job["file"] = filepath
+            ext = os.path.splitext(filepath)[1]
+
+            title = job.get("title", "").strip()
+            if title:
+                safe_title = "".join(c for c in title if c not in r'\\/:*?"<>|').strip()[:80].strip()
+                job["filename"] = f"{safe_title}{ext}" if safe_title else os.path.basename(filepath)
+            else:
+                cleaned = "".join(c for c in (original_name or "") if c not in r'\\/:*?"<>|').strip()
+                job["filename"] = cleaned or os.path.basename(filepath)
+
+            logger.info(f"[{job_id}] Terabox direct download successful")
+            return
+        except Exception as e:
+            logger.warning(f"[{job_id}] Terabox direct download failed: {e}")
+            job["status"] = "error"
+            job["error"] = str(e)
+            return
+
     # ── Try pytubefix first for YouTube URLs ────────────────────────────────
     if youtube:
         try:
@@ -726,6 +1093,15 @@ def get_info():
             return jsonify(info)
         except Exception as e:
             logger.warning(f"pytubefix info fetch failed: {e}, falling back to yt-dlp")
+
+    # ── Terabox dedicated extractor ───────────────────────────────────────────
+    if is_terabox_url(url):
+        try:
+            logger.info(f"Fetching info via Terabox API for: {url}")
+            info = terabox_get_info(url)
+            return jsonify(info)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
 
     # ── Fallback to yt-dlp (or primary for non-YouTube) ─────────────────────
     try:

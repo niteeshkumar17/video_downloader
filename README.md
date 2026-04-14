@@ -71,6 +71,15 @@ Note: keep-alive helps with idle spin-down. It does not fix YouTube datacenter I
 - If you see `Login with OAuth is no longer supported`, refresh/export cookies again and retry.
 - Never commit real cookie files to git.
 
+## Terabox Notes
+
+- Terabox links are handled through Terabox web APIs (not yt-dlp generic extraction).
+- Some links return `need verify` / `need verify_v2` until you provide a logged-in Terabox session cookie.
+- You can provide this via either:
+	- `TERABOX_COOKIE` environment variable (full cookie header string), or
+	- `video_downloader/terabox_cookies.txt` file (same cookie header string).
+- The app will also try to read Terabox cookies from `cookies.txt` if present in Netscape format.
+
 ## Tech Stack
 
 - **Backend**: Python + Flask
