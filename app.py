@@ -712,6 +712,9 @@ def terabox_get_info(url):
 
         raise Exception(normalize_terabox_error(last_error_data))
 
+    if not list_response:
+        raise Exception("Failed to fetch Terabox file info (no response from any API host)")
+
     file_item = pick_terabox_file(list_response.get("list") or [])
     if not file_item:
         raise Exception("No downloadable file found in this Terabox share")
