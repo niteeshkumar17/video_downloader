@@ -308,6 +308,35 @@
       background: var(--bg-secondary);
     }
 
+    .thumb-preview-wrap {
+      position: relative;
+      width: 100%;
+      height: 100%;
+    }
+
+    .thumb-preview-image,
+    .thumb-preview-video {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transition: opacity 0.16s ease;
+    }
+
+    .thumb-preview-video {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .thumb-preview-wrap.playing .thumb-preview-image {
+      opacity: 0;
+    }
+
+    .thumb-preview-wrap.playing .thumb-preview-video {
+      opacity: 1;
+    }
+
     .card-thumb .no-thumb {
       width: 100%;
       height: 100%;
@@ -855,6 +884,48 @@
       queueAutoPreview(idx);
     }
 
+    function startPreview(idx) {
+      const c = cardData[idx];
+      if (!c || !c.previewVideo) return;
+
+      const wrap = document.getElementById(`preview-wrap-${idx}`);
+      const video = document.getElementById(`preview-video-${idx}`);
+      if (!wrap || !video) return;
+
+      wrap.dataset.hovering = '1';
+      try {
+        video.currentTime = 0;
+      } catch {
+        // Ignore if browser blocks currentTime before media readiness.
+      }
+
+      video.play().then(() => {
+        if (wrap.dataset.hovering === '1') {
+          wrap.classList.add('playing');
+          return;
+        }
+        video.pause();
+        video.currentTime = 0;
+      }).catch(() => {
+        // Autoplay can fail on some browsers; keep image visible.
+      });
+    }
+
+    function stopPreview(idx) {
+      const wrap = document.getElementById(`preview-wrap-${idx}`);
+      const video = document.getElementById(`preview-video-${idx}`);
+      if (!wrap || !video) return;
+
+      wrap.dataset.hovering = '0';
+      wrap.classList.remove('playing');
+      video.pause();
+      try {
+        video.currentTime = 0;
+      } catch {
+        // Ignore if media state does not allow seek yet.
+      }
+    }
+
     // Enter key to fetch
     document.getElementById('urls').addEventListener('keydown', e => {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); go(); }
@@ -984,8 +1055,8 @@
       if (isAudio) {
         thumbHtml = `<div class="no-thumb" style="color:var(--accent-blue-bright)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>`;
       } else if (c.previewVideo) {
-        const poster = c.previewThumb || '';
-        thumbHtml = `<video src="${c.previewVideo}" ${poster ? `poster="${poster}"` : ''} autoplay muted loop playsinline preload="metadata"></video><span class="preview-badge">5s Preview</span>`;
+        const previewImage = c.previewThumb || c.thumbnail || buildInstantPoster(c.title || 'Video', c.url);
+        thumbHtml = `<div class="thumb-preview-wrap" id="preview-wrap-${idx}" onmouseenter="startPreview(${idx})" onmouseleave="stopPreview(${idx})"><img src="${previewImage}" alt="" loading="lazy" class="thumb-preview-image" onerror="onThumbError(${idx})"><video id="preview-video-${idx}" class="thumb-preview-video" src="${c.previewVideo}" muted loop playsinline preload="metadata"></video><span class="preview-badge">5s Preview</span></div>`;
       } else if (c.thumbnail && !c.thumbFailed) {
         thumbHtml = `<img src="${c.thumbnail}" alt="" loading="lazy" onerror="onThumbError(${idx})">`;
       } else if (c.previewLoading) {
