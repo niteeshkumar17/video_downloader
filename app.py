@@ -3,10 +3,12 @@ import re
 import uuid
 import glob
 import json
+import hashlib
 import subprocess
 import threading
 import base64
 import logging
+import time
 from urllib.parse import parse_qs, urlparse
 from flask import Flask, request, jsonify, send_file, render_template
 from flask_cors import CORS
@@ -20,6 +22,8 @@ CORS(app)
 
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+PREVIEW_DIR = os.path.join(DOWNLOAD_DIR, "previews")
+os.makedirs(PREVIEW_DIR, exist_ok=True)
 
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
 COOKIES_FROM_BROWSER = os.environ.get("YTDLP_COOKIES_FROM_BROWSER", "").strip()
@@ -167,18 +171,142 @@ def build_ytdlp_strategies(url):
 
 
 jobs = {}
+preview_lock = threading.Lock()
+PREVIEW_TTL_SECONDS = 1800
 
 
 def cleanup_old_files():
     """Remove downloaded files older than 30 minutes to save disk space on Render."""
-    import time
-    threshold = time.time() - 1800  # 30 minutes
-    for f in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
+    threshold = time.time() - PREVIEW_TTL_SECONDS
+    for root, _, files in os.walk(DOWNLOAD_DIR):
+        for name in files:
+            file_path = os.path.join(root, name)
+            try:
+                if os.path.getmtime(file_path) < threshold:
+                    os.remove(file_path)
+            except OSError:
+                pass
+
+
+def get_preview_id(url):
+    """Build a stable preview id for a URL to enable cache reuse."""
+    return hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+
+
+def get_preview_paths(preview_id):
+    """Return expected preview asset paths for a preview id."""
+    return (
+        os.path.join(PREVIEW_DIR, f"{preview_id}.mp4"),
+        os.path.join(PREVIEW_DIR, f"{preview_id}.jpg"),
+    )
+
+
+def preview_assets_exist(preview_id):
+    """Check whether both preview video and thumbnail are already available."""
+    preview_video, preview_thumb = get_preview_paths(preview_id)
+    return os.path.isfile(preview_video) and os.path.isfile(preview_thumb)
+
+
+def generate_preview_assets(url):
+    """Generate a 5 second preview clip and thumbnail for a video URL."""
+    preview_id = get_preview_id(url)
+    preview_video, preview_thumb = get_preview_paths(preview_id)
+    raw_template = os.path.join(PREVIEW_DIR, f"{preview_id}_raw.%(ext)s")
+    raw_pattern = os.path.join(PREVIEW_DIR, f"{preview_id}_raw.*")
+
+    if preview_assets_exist(preview_id):
+        return preview_id
+
+    with preview_lock:
+        if preview_assets_exist(preview_id):
+            return preview_id
+
+        youtube = is_youtube_url(url)
+        last_error = "Unable to fetch preview media"
+
+        for old_raw in glob.glob(raw_pattern):
+            try:
+                os.remove(old_raw)
+            except OSError:
+                pass
+
         try:
-            if os.path.getmtime(f) < threshold:
-                os.remove(f)
-        except OSError:
-            pass
+            strategies = build_ytdlp_strategies(url)
+            for extra_args in strategies:
+                cmd = [
+                    "yt-dlp",
+                    "--no-playlist",
+                    "--no-warnings",
+                    "--force-overwrites",
+                    "--download-sections", "*0-5",
+                    "-f", "best[ext=mp4][height<=480]/best[height<=480]/best[ext=mp4]/best",
+                    "-o", raw_template,
+                ] + get_ytdlp_network_args() + extra_args + [url]
+
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+                if result.returncode == 0:
+                    break
+
+                stderr = (result.stderr or result.stdout or "").strip()
+                last_error = normalize_ytdlp_error(stderr, youtube)
+            else:
+                raise Exception(last_error)
+
+            raw_files = glob.glob(raw_pattern)
+            if not raw_files:
+                raise Exception("Preview download did not produce a file")
+            raw_file = raw_files[0]
+
+            clip_cmd = [
+                "ffmpeg", "-y",
+                "-i", raw_file,
+                "-t", "5",
+                "-vf", "scale='min(720,iw)':-2",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-movflags", "+faststart",
+                "-an",
+                preview_video,
+            ]
+            clip_result = subprocess.run(clip_cmd, capture_output=True, text=True, timeout=120)
+            if clip_result.returncode != 0:
+                raise Exception("Failed to create preview video")
+
+            thumb_cmd = [
+                "ffmpeg", "-y",
+                "-ss", "1",
+                "-i", preview_video,
+                "-frames:v", "1",
+                "-q:v", "3",
+                preview_thumb,
+            ]
+            thumb_result = subprocess.run(thumb_cmd, capture_output=True, text=True, timeout=60)
+            if thumb_result.returncode != 0:
+                raise Exception("Failed to create preview thumbnail")
+
+            if not preview_assets_exist(preview_id):
+                raise Exception("Preview assets are incomplete")
+        except Exception:
+            for path in [preview_video, preview_thumb]:
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+            raise
+        finally:
+            for raw_file in glob.glob(raw_pattern):
+                try:
+                    os.remove(raw_file)
+                except OSError:
+                    pass
+
+    return preview_id
+
+
+def is_valid_preview_id(preview_id):
+    """Validate preview IDs to prevent path traversal."""
+    return re.fullmatch(r"[a-f0-9]{16}", preview_id or "") is not None
 
 
 # Clients to try in order — WEB triggers auto PO token generation via nodejs
@@ -557,6 +685,51 @@ def get_info():
         return jsonify(info)
     except Exception as e:
         return jsonify({"error": normalize_ytdlp_error(str(e), is_youtube_url(url))}), 400
+
+
+@app.route("/api/preview", methods=["POST"])
+def get_preview():
+    """Generate or fetch cached fallback preview assets for a URL."""
+    cleanup_old_files()
+
+    data = request.json or {}
+    url = normalize_video_url(data.get("url", ""))
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    try:
+        preview_id = generate_preview_assets(url)
+        return jsonify({
+            "thumbnail": f"/api/preview/thumb/{preview_id}",
+            "preview_video": f"/api/preview/video/{preview_id}",
+        })
+    except Exception as e:
+        logger.warning(f"Preview generation failed for {url}: {e}")
+        return jsonify({"error": normalize_ytdlp_error(str(e), is_youtube_url(url))}), 400
+
+
+@app.route("/api/preview/video/<preview_id>")
+def get_preview_video(preview_id):
+    if not is_valid_preview_id(preview_id):
+        return jsonify({"error": "Invalid preview id"}), 400
+
+    preview_video, _ = get_preview_paths(preview_id)
+    if not os.path.isfile(preview_video):
+        return jsonify({"error": "Preview video not found"}), 404
+
+    return send_file(preview_video, mimetype="video/mp4")
+
+
+@app.route("/api/preview/thumb/<preview_id>")
+def get_preview_thumb(preview_id):
+    if not is_valid_preview_id(preview_id):
+        return jsonify({"error": "Invalid preview id"}), 400
+
+    _, preview_thumb = get_preview_paths(preview_id)
+    if not os.path.isfile(preview_thumb):
+        return jsonify({"error": "Preview image not found"}), 404
+
+    return send_file(preview_thumb, mimetype="image/jpeg")
 
 
 @app.route("/api/download", methods=["POST"])

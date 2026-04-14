@@ -300,6 +300,14 @@
       display: block;
     }
 
+    .card-thumb video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+      background: var(--bg-secondary);
+    }
+
     .card-thumb .no-thumb {
       width: 100%;
       height: 100%;
@@ -314,6 +322,31 @@
       width: 28px;
       height: 28px;
       opacity: 0.5;
+    }
+
+    .card-thumb .no-thumb.busy {
+      flex-direction: column;
+      gap: 8px;
+      color: var(--accent-blue-bright);
+      font-size: 0.64rem;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+
+    .preview-badge {
+      position: absolute;
+      right: 6px;
+      bottom: 6px;
+      padding: 3px 7px;
+      border-radius: 999px;
+      font-size: 0.58rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: white;
+      background: rgba(0, 0, 0, 0.55);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      backdrop-filter: blur(3px);
     }
 
     /* Loading shimmer */
@@ -653,6 +686,7 @@
       document.querySelectorAll('.pill').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       currentFormat = btn.dataset.format;
+      cardData.forEach((_, idx) => renderCard(idx));
     }
 
     function parseUrls(text) {
@@ -694,6 +728,44 @@
       if (err.includes('timed out') || err.includes('Timed out')) return 'Request timed out — try again';
       if (err.includes('network') || err.includes('Network')) return 'Network error — check your connection';
       return err.length > 80 ? err.slice(0, 80) + '…' : err;
+    }
+
+    async function ensureAutoPreview(idx) {
+      const c = cardData[idx];
+      if (!c || c.status !== 'ready' || c.previewLoading || c.previewVideo || !c.url) return;
+
+      c.previewLoading = true;
+      renderCard(idx);
+
+      try {
+        const res = await fetch('/api/preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: c.url }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) {
+          throw new Error(data.error || 'Preview generation failed');
+        }
+
+        c.previewThumb = data.thumbnail || '';
+        c.previewVideo = data.preview_video || '';
+        if (!c.thumbnail && c.previewThumb) c.thumbnail = c.previewThumb;
+      } catch {
+        c.previewError = true;
+      } finally {
+        c.previewLoading = false;
+        renderCard(idx);
+      }
+    }
+
+    function onThumbError(idx) {
+      const c = cardData[idx];
+      if (!c || c.thumbFailed) return;
+      c.thumbFailed = true;
+      c.thumbnail = '';
+      renderCard(idx);
+      ensureAutoPreview(idx);
     }
 
     // Enter key to fetch
@@ -738,12 +810,21 @@
               uploader: data.uploader || '',
               formats: data.formats || [],
               selectedFormatId: data.formats?.[0]?.id || null,
+              previewThumb: '',
+              previewVideo: '',
+              previewLoading: false,
+              previewError: false,
+              thumbFailed: false,
             };
           }
         } catch (err) {
           cardData[idx] = { ...cardData[idx], status: 'info-error', error: err.message, isYouTube: isYouTubeUrl(url) };
         }
         renderCard(idx);
+
+        if (cardData[idx].status === 'ready' && !cardData[idx].thumbnail) {
+          ensureAutoPreview(idx);
+        }
       }
 
       if (cardData.filter(c => c.status === 'ready').length > 1) {
@@ -804,8 +885,13 @@
       let thumbHtml;
       if (isAudio) {
         thumbHtml = `<div class="no-thumb" style="color:var(--accent-blue-bright)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>`;
-      } else if (c.thumbnail) {
-        thumbHtml = `<img src="${c.thumbnail}" alt="" loading="lazy">`;
+      } else if (c.thumbnail && !c.thumbFailed) {
+        thumbHtml = `<img src="${c.thumbnail}" alt="" loading="lazy" onerror="onThumbError(${idx})">`;
+      } else if (c.previewVideo) {
+        const poster = c.previewThumb || '';
+        thumbHtml = `<video src="${c.previewVideo}" ${poster ? `poster="${poster}"` : ''} autoplay muted loop playsinline preload="metadata"></video><span class="preview-badge">5s Preview</span>`;
+      } else if (c.previewLoading) {
+        thumbHtml = `<div class="no-thumb busy"><span class="spin"></span><span>Creating preview</span></div>`;
       } else {
         thumbHtml = `<div class="no-thumb"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2"/><circle cx="8" cy="8" r="1.5"/><path d="m21 15-5-5L5 21"/></svg></div>`;
       }
