@@ -362,22 +362,6 @@
       text-transform: uppercase;
     }
 
-    .preview-badge {
-      position: absolute;
-      right: 6px;
-      bottom: 6px;
-      padding: 3px 7px;
-      border-radius: 999px;
-      font-size: 0.58rem;
-      font-weight: 600;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
-      color: white;
-      background: rgba(0, 0, 0, 0.55);
-      border: 1px solid rgba(255, 255, 255, 0.14);
-      backdrop-filter: blur(3px);
-    }
-
     /* Loading shimmer */
     .card-thumb.loading {
       background: linear-gradient(90deg, var(--bg-secondary) 25%, var(--bg-card) 50%, var(--bg-secondary) 75%);
@@ -1056,7 +1040,7 @@
         thumbHtml = `<div class="no-thumb" style="color:var(--accent-blue-bright)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>`;
       } else if (c.previewVideo) {
         const previewImage = c.previewThumb || c.thumbnail || buildInstantPoster(c.title || 'Video', c.url);
-        thumbHtml = `<div class="thumb-preview-wrap" id="preview-wrap-${idx}" onmouseenter="startPreview(${idx})" onmouseleave="stopPreview(${idx})"><img src="${previewImage}" alt="" loading="lazy" class="thumb-preview-image" onerror="onThumbError(${idx})"><video id="preview-video-${idx}" class="thumb-preview-video" src="${c.previewVideo}" muted loop playsinline preload="metadata"></video><span class="preview-badge">5s Preview</span></div>`;
+        thumbHtml = `<div class="thumb-preview-wrap" id="preview-wrap-${idx}" onmouseenter="startPreview(${idx})" onmouseleave="stopPreview(${idx})"><img src="${previewImage}" alt="" loading="lazy" class="thumb-preview-image" onerror="onThumbError(${idx})"><video id="preview-video-${idx}" class="thumb-preview-video" src="${c.previewVideo}" muted loop playsinline preload="metadata"></video></div>`;
       } else if (c.thumbnail && !c.thumbFailed) {
         thumbHtml = `<img src="${c.thumbnail}" alt="" loading="lazy" onerror="onThumbError(${idx})">`;
       } else if (c.previewLoading) {
