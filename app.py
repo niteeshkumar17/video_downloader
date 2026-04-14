@@ -315,15 +315,34 @@ def extract_terabox_template_data(html):
 
 
 def extract_terabox_js_token(html):
-    """Extract jsToken from encoded inline script."""
+    """Extract jsToken from share page using multiple fallback patterns."""
     html = html or ""
-    m = re.search(r"fn%28%22([A-F0-9]+)%22%29", html)
-    if m:
-        return m.group(1)
 
-    m = re.search(r"window\.jsToken\s*=\s*\"([A-F0-9]+)\"", html)
+    # Pattern 1: URL-encoded fn call
+    m = re.search(r"fn%28%22([A-F0-9a-f]+)%22%29", html)
     if m:
-        return m.group(1)
+        return m.group(1).upper()
+
+    # Pattern 2: window.jsToken assignment
+    m = re.search(r"window\.jsToken\s*=\s*[\"']([A-F0-9a-f]+)[\"']", html)
+    if m:
+        return m.group(1).upper()
+
+    # Pattern 3: jsToken inside JSON payload
+    m = re.search(r'"jsToken"\s*:\s*"([A-F0-9a-f]{16,})"', html)
+    if m:
+        return m.group(1).upper()
+
+    # Pattern 4: var jsToken = "..."
+    m = re.search(r'var\s+jsToken\s*=\s*["\']([A-F0-9a-f]{16,})["\']', html, re.I)
+    if m:
+        return m.group(1).upper()
+
+    # Pattern 5: fn("HEX") un-encoded
+    m = re.search(r'fn\(["\']([A-F0-9a-f]{16,})["\']\)', html)
+    if m:
+        return m.group(1).upper()
+
     return ""
 
 
@@ -335,23 +354,44 @@ def normalize_terabox_error(error_data):
     code = error_data.get("errno")
     if code is None:
         code = error_data.get("code")
-    msg = (error_data.get("errmsg") or "").strip()
+    try:
+        code_int = int(code)
+    except (TypeError, ValueError):
+        code_int = code
 
-    if code in (460020, 400210):
+    msg = (error_data.get("errmsg") or error_data.get("error_msg") or "").strip()
+
+    if code_int == -3:
+        return (
+            "Terabox requires a logged-in session for this link. "
+            "Set TERABOX_COOKIE with your browser session cookies and retry."
+        )
+    if code_int in (9019, 9013):
+        return (
+            "Terabox triggered a CAPTCHA/verification check. "
+            "Open the link in browser, complete verification, then export fresh cookies and set TERABOX_COOKIE."
+        )
+    if code_int in (31045, 31001):
+        return (
+            "Terabox blocked the server-side download path for this request. "
+            "The direct link may still work in a browser session."
+        )
+
+    if code_int in (460020, 400210):
         return (
             "Terabox requires verification for this link right now. "
             "Add a logged-in Terabox cookie via TERABOX_COOKIE or terabox_cookies.txt and retry."
         )
-    if code == 400141:
+    if code_int == 400141:
         return (
             "This Terabox/1024tera share currently requires verification or an extraction code. "
             "Open the link in browser, complete verification (and code if prompted), then export fresh cookies and retry."
         )
-    if code in (105, 2):
+    if code_int in (105, 2):
         return "This Terabox link looks invalid, expired, or protected."
     if msg:
-        return f"Terabox error: {msg}"
-    return "Failed to fetch Terabox file info"
+        return f"Terabox error (errno={code_int}): {msg}"
+    return f"Failed to fetch Terabox file info (errno={code_int})"
 
 
 def terabox_is_dir(value):
@@ -369,6 +409,17 @@ def is_terabox_family_host(host):
     """Return True when host belongs to Terabox/1024tera family."""
     host = (host or "").lower()
     return any(hint in host for hint in TERABOX_HOST_HINTS)
+
+
+def is_terabox_api_host(host):
+    """Return True for Terabox-like hosts that serve API endpoints."""
+    h = (host or "").strip().lower()
+    if not h:
+        return False
+    # d./dm. hosts are CDN/download hosts and should be skipped for API calls.
+    if h.startswith("d.") or h.startswith("dm."):
+        return False
+    return is_terabox_family_host(h)
 
 
 def pick_terabox_file(items):
@@ -503,17 +554,15 @@ def terabox_get_info(url):
 
     def add_host(host):
         h = (host or "").strip().lower()
-        if h and h not in hosts_to_try:
+        if h and is_terabox_api_host(h) and h not in hosts_to_try:
             hosts_to_try.append(h)
 
     add_host(input_host)
     for host in (
         "www.terabox.com",
         "www.terabox.app",
-        "dm.1024terabox.com",
         "www.1024terabox.com",
         "1024terabox.com",
-        "dm.1024tera.com",
         "www.1024tera.com",
         "1024tera.com",
     ):
@@ -539,11 +588,26 @@ def terabox_get_info(url):
     share_host = (parsed_share.netloc or "").lower()
     share_origin = f"{share_scheme}://{share_host}" if share_host else input_origin
     if share_host:
-        if share_host in hosts_to_try:
-            hosts_to_try.remove(share_host)
-        hosts_to_try.insert(0, share_host)
+        if is_terabox_api_host(share_host):
+            if share_host in hosts_to_try:
+                hosts_to_try.remove(share_host)
+            hosts_to_try.insert(0, share_host)
 
     html = share_resp.text or ""
+    lower_html = html.lower()
+    if (
+        "needverify" in lower_html
+        or "need_verify" in lower_html
+        or "verify-code" in lower_html
+        or "accessdenied" in lower_html
+        or ("captcha" in lower_html and "jstoken" not in lower_html)
+    ):
+        raise Exception(
+            "Terabox is showing a verification/CAPTCHA page for this link. "
+            "Open the URL in browser, complete verification, export your cookies, "
+            "and set TERABOX_COOKIE."
+        )
+
     js_token = extract_terabox_js_token(html)
     if not js_token:
         raise Exception("Could not read Terabox access token from share page")
@@ -603,6 +667,9 @@ def terabox_get_info(url):
 
     # Fallback call for clearer verification/private-link errors.
     if not list_response:
+        list_error_data = last_error_data
+        shorturlinfo_ok = False
+
         short_params = {
             "app_id": "250528",
             "web": "1",
@@ -625,8 +692,20 @@ def terabox_get_info(url):
             except ValueError:
                 continue
             last_error_data = data
+
             if data.get("errno") == 0 or data.get("code") == 0:
+                shorturlinfo_ok = True
+                if isinstance(data.get("list"), list) and data.get("list"):
+                    list_response = data
                 break
+
+        if list_response:
+            pass
+        elif shorturlinfo_ok:
+            # shorturlinfo succeeded but no downloadable list payload was returned.
+            raise Exception("No downloadable file found in this Terabox share")
+        elif list_error_data:
+            raise Exception(normalize_terabox_error(list_error_data))
 
         if not last_error_data and last_network_error:
             raise Exception(f"Terabox network error: {last_network_error}")
