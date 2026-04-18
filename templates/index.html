@@ -443,7 +443,76 @@
 
     .card-dl-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; box-shadow: none; }
     .card-dl-btn.done { background: var(--success); }
+    .card-dl-btn.play { background: linear-gradient(135deg, #8b5cf6 0%, #6d28d9 100%); }
+    .card-dl-btn.play:hover { box-shadow: 0 4px 16px rgba(139, 92, 246, 0.45); }
     .card-dl-btn.error { background: var(--error); }
+
+    /* ── Video Player Modal ───────────────────────────────── */
+    #vid-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      background: rgba(0,0,0,0.85);
+      backdrop-filter: blur(6px);
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    #vid-modal.open { display: flex; }
+    #vid-modal-inner {
+      position: relative;
+      width: 100%;
+      max-width: 860px;
+      background: #0f1117;
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 24px 80px rgba(0,0,0,0.7);
+      animation: modal-in 0.22s ease;
+    }
+    @keyframes modal-in {
+      from { opacity: 0; transform: scale(0.95) translateY(12px); }
+      to   { opacity: 1; transform: scale(1) translateY(0); }
+    }
+    #vid-modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 16px;
+      background: rgba(255,255,255,0.04);
+      border-bottom: 1px solid rgba(255,255,255,0.07);
+    }
+    #vid-modal-title {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: #e2e8f0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: calc(100% - 40px);
+    }
+    #vid-modal-close {
+      background: rgba(255,255,255,0.08);
+      border: none;
+      border-radius: 50%;
+      width: 30px;
+      height: 30px;
+      cursor: pointer;
+      color: #94a3b8;
+      font-size: 1.1rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.2s, color 0.2s;
+      flex-shrink: 0;
+    }
+    #vid-modal-close:hover { background: rgba(239,68,68,0.2); color: #f87171; }
+    #vid-modal video {
+      width: 100%;
+      display: block;
+      max-height: 75vh;
+      background: #000;
+    }
 
     .card-status {
       font-size: 0.7rem;
@@ -954,6 +1023,7 @@
               uploader: data.uploader || '',
               formats: data.formats || [],
               selectedFormatId: data.formats?.[0]?.id || null,
+              externalUrl: data.terabox_dlink || '',
               previewThumb: '',
               previewVideo: '',
               previewId: '',
@@ -1058,11 +1128,17 @@
 
       let actionHtml = '';
       if (c.status === 'ready') {
-        actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Download</button>${qualityChips}`;
+        const playBtn = c.externalUrl
+          ? `<button class="card-dl-btn play" onclick="playCard(${idx})" title="Play in browser">&#9654; Play</button>`
+          : '';
+        actionHtml = `${playBtn}<button class="card-dl-btn" onclick="dlCard(${idx})">Download</button>${qualityChips}`;
       } else if (c.status === 'downloading') {
         actionHtml = `<span class="card-status downloading"><span class="spin"></span> Downloading...</span>`;
       } else if (c.status === 'done') {
-        actionHtml = `<button class="card-dl-btn done" onclick="saveCard(${idx})">Save File</button>
+        const playBtn = c.externalUrl
+          ? `<button class="card-dl-btn play" onclick="playCard(${idx})" title="Play in browser">▶ Play</button>`
+          : '';
+        actionHtml = `${playBtn}<button class="card-dl-btn done" onclick="saveCard(${idx})">Save File</button>
           <span class="card-status done">${esc(c.filename || '')}</span>`;
       } else if (c.status === 'error') {
         actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Retry</button>
@@ -1193,6 +1269,44 @@
 
       if (btn) { btn.disabled = false; btn.textContent = 'Download All'; }
     }
+
+    // ── Video player modal ──────────────────────────────────────────────────
+    function playCard(idx) {
+      const c = cardData[idx];
+      if (!c.externalUrl) return;
+      const modal = document.getElementById('vid-modal');
+      const video = document.getElementById('vid-player');
+      const title = document.getElementById('vid-modal-title');
+      title.textContent = c.title || c.filename || 'Terabox Video';
+      // Route through proxy so Cookie/Referer headers are added server-side
+      video.src = '/api/proxy-video?u=' + encodeURIComponent(c.externalUrl);
+      modal.classList.add('open');
+      video.play().catch(() => {});
+    }
+
+    function closeVidModal() {
+      const modal = document.getElementById('vid-modal');
+      const video = document.getElementById('vid-player');
+      modal.classList.remove('open');
+      video.pause();
+      video.src = '';
+    }
+
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') closeVidModal();
+    });
   </script>
+
+  <!-- Video Player Modal -->
+  <div id="vid-modal" onclick="if(event.target===this)closeVidModal()">
+    <div id="vid-modal-inner">
+      <div id="vid-modal-header">
+        <div id="vid-modal-title">Video</div>
+        <button id="vid-modal-close" onclick="closeVidModal()" title="Close">✕</button>
+      </div>
+      <video id="vid-player" controls controlsList="nodownload" playsinline></video>
+    </div>
+  </div>
+
 </body>
 </html>

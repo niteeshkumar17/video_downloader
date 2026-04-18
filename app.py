@@ -36,14 +36,22 @@ TERABOX_COOKIE = os.environ.get("TERABOX_COOKIE", "").strip()
 TERABOX_USER_AGENT = (
     os.environ.get("TERABOX_USER_AGENT", "").strip()
     or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0"
 )
 TERABOX_HOST_HINTS = (
     "terabox.com",
     "terabox.app",
+    "dm.terabox.app",
     "1024terabox.com",
     "1024tera.com",
     "nephobox.com",
+    "freeterabox.com",
+    "www.freeterabox.com",
+    "4funbox.com",
+    "mirrobox.com",
+    "momerybox.com",
+    "tibibox.com",
+    "dm.1024terabox.com",
 )
 
 
@@ -146,13 +154,14 @@ def normalize_video_url(url):
         host = (parsed.netloc or "").lower()
         path = parsed.path or ""
 
-        # Terabox variants -> canonical share URL on the same host
+        # Terabox variants → canonical share URL on www.terabox.app using /s/ format
+        # IMPORTANT: Using /s/SURL causes the redirect to strip the regional '1' prefix,
+        # giving surl=X6gwi_... instead of 1X6gwi_..., which is required for /share/list errno=0.
         if any(hint in host for hint in TERABOX_HOST_HINTS):
             surl = extract_terabox_surl(url)
             if surl:
                 scheme = parsed.scheme if parsed.scheme in ("http", "https") else "https"
-                canonical_host = parsed.netloc or "www.terabox.com"
-                return f"{scheme}://{canonical_host}/sharing/link?surl={quote(surl, safe='')}"
+                return f"{scheme}://www.terabox.app/s/{quote(surl, safe='')}"
 
         # youtu.be/<id> -> youtube watch URL
         if "youtu.be" in host:
@@ -292,14 +301,26 @@ def get_terabox_cookie_header():
     return ""
 
 
-def build_terabox_dp_logid(uk=None, client=""):
-    """Build dp-logid value similar to Terabox's dplogid script."""
+def extract_terabox_dp_logid(html):
+    """Extract the real dp-logid from Terabox share page HTML.
+
+    Terabox validates this server-side, so generating a random one fails.
+    Falls back to a generated value only when absent.
+    """
+    html = html or ""
+    # Pattern: dp-logid=<value>& (encoded in URLs on page)
+    m = re.search(r"dp-logid=([\w%+.\-]+)(?:&|\b)", html)
+    if m:
+        from urllib.parse import unquote
+        return unquote(m.group(1)).strip()
+    # Fallback: window.dplogid or similar JS assignments
+    m = re.search(r'(?:dplogid|dp_logid|dp-logid)["\']?\s*[:=]\s*["\']([\w.\-]+)["\']', html, re.I)
+    if m:
+        return m.group(1).strip()
+    # Last resort: generate a plausible-looking one
     session_id = random.randint(100000, 999999)
-    if uk and re.fullmatch(r"\d{10}", str(uk)):
-        user_id = str(uk)
-    else:
-        user_id = f"00{random.randint(10000000, 99999999)}"
-    return f"{client}{session_id}{user_id}0001"
+    user_id = f"00{random.randint(10000000, 99999999)}"
+    return f"{session_id}{user_id}0001"
 
 
 def extract_terabox_template_data(html):
@@ -558,9 +579,11 @@ def terabox_get_info(url):
             hosts_to_try.append(h)
 
     add_host(input_host)
+    # dm.terabox.app is the actual serving domain Terabox redirects to — try it first
     for host in (
-        "www.terabox.com",
+        "dm.terabox.app",
         "www.terabox.app",
+        "www.terabox.com",
         "www.1024terabox.com",
         "1024terabox.com",
         "www.1024tera.com",
@@ -571,11 +594,29 @@ def terabox_get_info(url):
     cookie_header = get_terabox_cookie_header()
 
     session = requests.Session()
+    # Seed the session cookie jar with the user-provided Terabox cookies.
+    # This lets the session send them automatically (like a real browser) on ALL
+    # subsequent API requests to Terabox domains, including share/list.
+    if cookie_header:
+        for kv in cookie_header.split(";"):
+            kv = kv.strip()
+            if "=" in kv:
+                k, _, v = kv.partition("=")
+                for terabox_domain in (".terabox.com", ".terabox.app", ".1024terabox.com", ".1024tera.com"):
+                    session.cookies.set(k.strip(), v.strip(), domain=terabox_domain)
+
     share_headers = {
         "User-Agent": TERABOX_USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": f"{input_origin}/",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
     }
     if cookie_header:
         share_headers["Cookie"] = cookie_header
@@ -587,11 +628,19 @@ def terabox_get_info(url):
     share_scheme = parsed_share.scheme if parsed_share.scheme in ("http", "https") else "https"
     share_host = (parsed_share.netloc or "").lower()
     share_origin = f"{share_scheme}://{share_host}" if share_host else input_origin
-    if share_host:
-        if is_terabox_api_host(share_host):
-            if share_host in hosts_to_try:
-                hosts_to_try.remove(share_host)
-            hosts_to_try.insert(0, share_host)
+    # Always add the redirect host first — it's the authoritative serving domain for this share
+    if share_host and share_host not in hosts_to_try:
+        hosts_to_try.insert(0, share_host)
+    elif share_host and share_host in hosts_to_try:
+        hosts_to_try.remove(share_host)
+        hosts_to_try.insert(0, share_host)
+
+    # Re-extract surl from the REDIRECTED URL (e.g. dm.terabox.app/sharing/link?surl=X6gwi_...)
+    # The original short URL has a regional prefix (e.g. '1X6gwi_...') that must be stripped.
+    redirected_surl = extract_terabox_surl(share_resp.url)
+    if redirected_surl and redirected_surl != surl:
+        logger.info(f"Terabox surl updated after redirect: {surl!r} → {redirected_surl!r}")
+        surl = redirected_surl
 
     html = share_resp.text or ""
     lower_html = html.lower()
@@ -612,10 +661,61 @@ def terabox_get_info(url):
     if not js_token:
         raise Exception("Could not read Terabox access token from share page")
 
+    # Extract the real dp-logid that Terabox set in the page (server validates it)
+    dp_logid = extract_terabox_dp_logid(html)
+
     template_data = extract_terabox_template_data(html)
     uk = template_data.get("uk")
     bdstoken = template_data.get("bdstoken")
-    dp_logid = build_terabox_dp_logid(uk=uk)
+
+    # Try extracting direct file/dlink info from the embedded page data
+    # Terabox embeds file info (fs_id, filename, dlink, sign) directly in the HTML
+    page_file_list = template_data.get("list") or template_data.get("fileList") or []
+    if not page_file_list and template_data.get("shareid"):
+        # Try extracting file info from the file info structures in templateData
+        for key in ("file", "fileInfo", "video", "videoInfo"):
+            if template_data.get(key):
+                item = template_data[key]
+                if isinstance(item, list):
+                    page_file_list = item
+                elif isinstance(item, dict):
+                    page_file_list = [item]
+                break
+
+    # Also search for dlink/play_url/vlist directly in the raw HTML
+    raw_dlink = None
+    for pattern in (
+        r'"dlink"\s*:\s*"([^"]{40,})"',
+        r'"play_url"\s*:\s*"([^"]{40,})"',
+        r'"download_addr"\s*:\s*"([^"]{40,})"',
+    ):
+        m = re.search(pattern, html)
+        if m:
+            raw_dlink = m.group(1).replace("\\u0026", "&").replace("\\/", "/")
+            break
+
+    if raw_dlink and not page_file_list:
+        # We found a direct link in the page — use it immediately
+        fname_m = re.search(r'"server_filename"\s*:\s*"([^"]+)"', html) or re.search(r'"filename"\s*:\s*"([^"]+)"', html)
+        fname = fname_m.group(1) if fname_m else "terabox_file"
+        thumb_m = re.search(r'"url3"\s*:\s*"([^"]+)"', html)
+        thumb = thumb_m.group(1).replace("\\/", "/") if thumb_m else ""
+        logger.info(f"Terabox: found dlink directly in page HTML for {fname!r}")
+        return {
+            "title": fname, "thumbnail": thumb,
+            "duration": None, "uploader": "Terabox",
+            "formats": [{"id": "terabox_direct", "label": "Original", "height": 1}],
+            "terabox_dlink": raw_dlink, "terabox_filename": fname,
+            "terabox_referer": share_resp.url,
+        }
+
+    # Also try to extract bdstoken directly from HTML if templateData missed it
+    if not bdstoken:
+        m = re.search(r'bdstoken["\']?\s*[:=,{]\s*["\']([A-Za-z0-9_\-]{8,})["\']', html)
+        if m:
+            bdstoken = m.group(1)
+
+    logger.info(f"Terabox tokens — jsToken={js_token[:12]}… dp_logid={dp_logid} bdstoken={bdstoken}")
 
     list_params = {
         "app_id": "250528",
@@ -637,18 +737,48 @@ def terabox_get_info(url):
 
     api_headers = {
         "User-Agent": TERABOX_USER_AGENT,
-        "Accept": "application/json,text/plain,*/*",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+        "DNT": "1",
         "Referer": share_resp.url,
         "Origin": share_origin,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
         "X-Requested-With": "XMLHttpRequest",
     }
-    if cookie_header:
-        api_headers["Cookie"] = cookie_header
+    # Do NOT set Cookie explicitly — the session cookie jar handles it automatically
+    # (mimics a real browser session which is what Terabox checks for)
 
     list_response = None
     last_error_data = None
     last_network_error = None
+
+    # --- Try 0: Bare call using just the surl (no auth, matches TeraDL mode 3 style) ---
+    for host in ("dm.terabox.app", "www.terabox.app", "www.terabox.com", "1024terabox.com"):
+        try:
+            bare_r = session.get(
+                f"https://{host}/share/list",
+                params={"app_id": "250528", "shorturl": surl, "root": "1"},
+                headers={
+                    "user-agent": TERABOX_USER_AGENT,
+                    "Referer": f"https://{host}/sharing/link?surl={surl}",
+                },
+                timeout=20,
+            )
+            bare_data = bare_r.json()
+            logger.info(f"Bare /share/list [{host}] → errno={bare_data.get('errno')} len={len(bare_data.get('list') or [])}")
+            if bare_data.get("errno") == 0 and bare_data.get("list"):
+                list_response = bare_data
+                break
+        except Exception as e:
+            logger.warning(f"Bare share/list [{host}]: {e}")
+
     for host in hosts_to_try:
+        if list_response:
+            break
         endpoint = f"https://{host}/share/list"
         try:
             r = session.get(endpoint, params=list_params, headers=api_headers, timeout=30)
@@ -659,58 +789,177 @@ def terabox_get_info(url):
             data = r.json()
         except ValueError:
             continue
-
         if data.get("errno") == 0 and isinstance(data.get("list"), list) and data.get("list"):
             list_response = data
             break
+        logger.warning(f"Terabox /share/list [{host}] → errno={data.get('errno')} errmsg={data.get('errmsg') or data.get('error_msg')} raw_keys={list(data.keys())}")
         last_error_data = data
 
-    # Fallback call for clearer verification/private-link errors.
+    # Fallback path: /share/list returned errno=105.
+    # Strategy:
+    #   1. Call /api/shorturlinfo — it often returns errno=0 with all the sign fields + fid
+    #   2. Use those to call /api/sharedownload (POST with fid_list JSON) or Terabox's GET sharedownload
+    #   3. If that fails, try HNN worker API as last resort
     if not list_response:
-        list_error_data = last_error_data
-        shorturlinfo_ok = False
+        si_shareid = si_uk = si_sign = si_ts = si_fid = si_fname = None
 
-        short_params = {
-            "app_id": "250528",
-            "web": "1",
-            "channel": "dubox",
-            "clienttype": "0",
-            "jsToken": js_token,
-            "dp-logid": dp_logid,
-            "shorturl": surl,
-            "surl": surl,
-        }
+        # Step 1: call shorturlinfo (try all hosts)
         for host in hosts_to_try:
-            endpoint = f"https://{host}/api/shorturlinfo"
             try:
-                r = session.get(endpoint, params=short_params, headers=api_headers, timeout=20)
-            except requests.RequestException as e:
+                si_r = session.get(
+                    f"https://{host}/api/shorturlinfo",
+                    params={"app_id": "250528", "web": "1", "channel": "dubox",
+                            "clienttype": "0", "jsToken": js_token,
+                            "dp-logid": dp_logid, "shorturl": surl, "root": "1"},
+                    headers=api_headers, timeout=20
+                )
+                si_data = si_r.json()
+                last_error_data = si_data
+                logger.info(f"shorturlinfo [{host}] → errno={si_data.get('errno')} shareid={si_data.get('shareid')} fid={si_data.get('fid')}")
+                if si_data.get("shareid") and si_data.get("uk"):
+                    si_shareid = str(si_data["shareid"])
+                    si_uk = str(si_data["uk"])
+                    si_sign = str(si_data.get("sign") or "")
+                    si_ts = str(si_data.get("timestamp") or "")
+                    si_fid = si_data.get("fid")
+                    si_fname = (si_data.get("dir") or "").rstrip("/").split("/")[-1] or None
+                    break
+            except Exception as e:
                 last_network_error = e
                 continue
+
+        # Step 2: if we have shareid+uk, get file list; for folder shares (fid=0) list content
+        if si_shareid and si_uk:
+            # Attempt to get files: first try bare no-auth /share/list with 1+surl
+            for host in ("dm.terabox.app", "www.terabox.app", "www.terabox.com", "1024terabox.com"):
+                try:
+                    bare2_r = session.get(
+                        f"https://{host}/share/list",
+                        params={"app_id": "250528", "shorturl": surl, "root": "1"},
+                        headers={
+                            "user-agent": TERABOX_USER_AGENT,
+                            "Referer": share_resp.url,
+                        },
+                        timeout=20,
+                    )
+                    b2 = bare2_r.json()
+                    logger.info(f"Fallback bare /share/list [{host}] → errno={b2.get('errno')} len={len(b2.get('list') or [])}")
+                    if b2.get("errno") == 0 and b2.get("list"):
+                        list_response = b2
+                        break
+                    for item in (b2.get("list") or []):
+                        if item.get("fs_id") and not int(item.get("isdir", 0)):
+                            si_fid = item["fs_id"]
+                            si_fname = item.get("server_filename")
+                            break
+                except Exception:
+                    pass
+                if list_response or si_fid:
+                    break
+            fid_str = str(si_fid)
+
+            # Build base params (no cookie needed for this path)
+            sd_base = {
+                "app_id": "250528", "web": "1", "channel": "dubox", "clienttype": "0",
+                "jsToken": js_token, "dp-logid": dp_logid,
+                "primaryid": si_shareid, "uk": si_uk,
+                "sign": si_sign, "timestamp": si_ts,
+                "product": "share", "nozip": "0",
+            }
+
+            for host in hosts_to_try:
+                req_h = dict(api_headers)
+                req_h["Host"] = host
+                req_h["Origin"] = f"https://{host}"
+
+                # Try GET with fid_list param
+                try:
+                    sd_params = dict(sd_base)
+                    sd_params["fid_list"] = f"[{fid_str}]"
+                    sd_r = session.get(f"https://{host}/api/sharedownload",
+                                       params=sd_params, headers=req_h, timeout=30)
+                    sd_data = sd_r.json()
+                    logger.info(f"/api/sharedownload GET [{host}] → errno={sd_data.get('errno')} list={sd_data.get('list')}")
+                    if sd_data.get("errno") == 0 and sd_data.get("list"):
+                        for item in sd_data["list"]:
+                            dlink = item.get("dlink") or item.get("downloadlink") or item.get("download_link")
+                            if dlink:
+                                fname = si_fname or item.get("server_filename") or "terabox_file"
+                                return {
+                                    "title": fname, "thumbnail": "",
+                                    "duration": None, "uploader": "Terabox",
+                                    "formats": [{"id": "terabox_direct", "label": "Original", "height": 1}],
+                                    "terabox_dlink": dlink, "terabox_filename": fname,
+                                    "terabox_referer": share_resp.url,
+                                }
+                    last_error_data = sd_data
+                except Exception as e:
+                    last_network_error = e
+
+                # Try POST with JSON body
+                try:
+                    post_body = {
+                        "app_id": "250528", "web": "1", "channel": "dubox",
+                        "jsToken": js_token, "primaryid": si_shareid, "uk": si_uk,
+                        "sign": si_sign, "timestamp": si_ts,
+                        "product": "share", "fid_list": f"[{fid_str}]",
+                    }
+                    sd_r2 = session.post(f"https://{host}/api/sharedownload",
+                                         json=post_body, headers=req_h, timeout=30)
+                    sd_data2 = sd_r2.json()
+                    logger.info(f"/api/sharedownload POST [{host}] → errno={sd_data2.get('errno')} list={sd_data2.get('list')}")
+                    if sd_data2.get("errno") == 0 and sd_data2.get("list"):
+                        for item in sd_data2["list"]:
+                            dlink = item.get("dlink") or item.get("downloadlink") or item.get("download_link")
+                            if dlink:
+                                fname = si_fname or item.get("server_filename") or "terabox_file"
+                                return {
+                                    "title": fname, "thumbnail": "",
+                                    "duration": None, "uploader": "Terabox",
+                                    "formats": [{"id": "terabox_direct", "label": "Original", "height": 1}],
+                                    "terabox_dlink": dlink, "terabox_filename": fname,
+                                    "terabox_referer": share_resp.url,
+                                }
+                    last_error_data = sd_data2
+                except Exception as e:
+                    last_network_error = e
+
+        # Step 3: HNN worker API fallback (may be Cloudflare-protected)
+        if not list_response and si_shareid and si_uk and si_sign and si_fid:
+            hnn_base = "https://terabox.hnn.workers.dev/api"
+            hnn_h = {
+                "accept-language": "en-US,en;q=0.9",
+                "referer": "https://terabox.hnn.workers.dev/",
+                "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin",
+                "user-agent": TERABOX_USER_AGENT,
+            }
             try:
-                data = r.json()
-            except ValueError:
-                continue
-            last_error_data = data
+                payload = {"shareid": si_shareid, "uk": si_uk, "sign": si_sign,
+                           "timestamp": si_ts, "fs_id": str(si_fid)}
+                dl_r = session.post(f"{hnn_base}/get-download", json=payload, headers=hnn_h, timeout=25)
+                dl_data = dl_r.json()
+                logger.info(f"HNN get-download → keys={list(dl_data.keys())}")
+                dlink = dl_data.get("downloadLink") or dl_data.get("download_link") or dl_data.get("dlink")
+                if dlink:
+                    fname = si_fname or "terabox_file"
+                    return {
+                        "title": fname, "thumbnail": "", "duration": None, "uploader": "Terabox",
+                        "formats": [{"id": "terabox_direct", "label": "Original", "height": 1}],
+                        "terabox_dlink": dlink, "terabox_filename": fname,
+                        "terabox_referer": share_resp.url,
+                    }
+            except Exception as e:
+                logger.warning(f"HNN fallback failed: {e}")
 
-            if data.get("errno") == 0 or data.get("code") == 0:
-                shorturlinfo_ok = True
-                if isinstance(data.get("list"), list) and data.get("list"):
-                    list_response = data
-                break
+        if not list_response:
+            if last_error_data:
+                raise Exception(normalize_terabox_error(last_error_data))
+            if last_network_error:
+                raise Exception(f"Terabox network error: {last_network_error}")
+            raise Exception("Failed to fetch Terabox file info — please check the link or try again later")
 
-        if list_response:
-            pass
-        elif shorturlinfo_ok:
-            # shorturlinfo succeeded but no downloadable list payload was returned.
-            raise Exception("No downloadable file found in this Terabox share")
-        elif list_error_data:
-            raise Exception(normalize_terabox_error(list_error_data))
-
-        if not last_error_data and last_network_error:
-            raise Exception(f"Terabox network error: {last_network_error}")
-
-        raise Exception(normalize_terabox_error(last_error_data))
+    if not list_response:
+        hnn_base = "https://terabox.hnn.workers.dev/api"
 
     if not list_response:
         raise Exception("Failed to fetch Terabox file info (no response from any API host)")
@@ -756,7 +1005,7 @@ def terabox_get_info(url):
 
 
 def terabox_download(job_id, url, format_choice):
-    """Download file directly from Terabox dlink."""
+    """Resolve Terabox dlink and store it for direct browser download."""
     info = terabox_get_info(url)
     dlink = info.get("terabox_dlink")
     if not dlink:
@@ -767,19 +1016,47 @@ def terabox_download(job_id, url, format_choice):
     if not re.fullmatch(r"\.[a-z0-9]{1,6}", ext or ""):
         ext = ".mp4"
 
-    temp_path = os.path.join(DOWNLOAD_DIR, f"{job_id}{ext}")
-    final_path = temp_path
-
     headers = {
         "User-Agent": TERABOX_USER_AGENT,
         "Referer": info.get("terabox_referer") or normalize_video_url(url),
     }
     cookie_header = get_terabox_cookie_header()
+
+    # Use a session with cookies for Terabox CDN domains
+    dl_session = requests.Session()
     if cookie_header:
         headers["Cookie"] = cookie_header
+        for kv in cookie_header.split(";"):
+            kv = kv.strip()
+            if "=" in kv:
+                k, _, v = kv.partition("=")
+                for d in (".terabox.com", ".terabox.app", ".1024terabox.com",
+                          ".1024tera.com", "dm-d.terabox.app", ".dm-d.terabox.app"):
+                    dl_session.cookies.set(k.strip(), v.strip(), domain=d)
 
-    with requests.get(dlink, headers=headers, stream=True, timeout=90, allow_redirects=True) as r:
-        response_host = (urlparse(r.url or dlink).netloc or "").lower()
+    # Quick HEAD check to verify the dlink is accessible before handing to browser
+    try:
+        head_r = dl_session.head(dlink, headers=headers, timeout=15, allow_redirects=True)
+        final_url = head_r.url  # follow any redirects to get final CDN URL
+        if head_r.status_code == 200:
+            logger.info(f"[{job_id}] Terabox dlink HEAD OK → {final_url[:80]}")
+            # Store dlink for direct browser download — no server-side buffering
+            return None, original_name, final_url
+        elif head_r.status_code in (401, 403):
+            raise TeraboxExternalDownloadRequired(dlink=dlink, filename=original_name)
+        else:
+            logger.warning(f"[{job_id}] Terabox HEAD {head_r.status_code}, falling back to proxy download")
+            final_url = dlink
+    except TeraboxExternalDownloadRequired:
+        raise
+    except Exception as e:
+        logger.warning(f"[{job_id}] Terabox HEAD failed: {e}, trying proxy download")
+        final_url = dlink
+
+    # Fallback: server-side proxy download (for short/small files where HEAD failed)
+    temp_path = os.path.join(DOWNLOAD_DIR, f"{job_id}{ext}")
+    with dl_session.get(final_url, headers=headers, stream=True, timeout=90, allow_redirects=True) as r:
+        response_host = (urlparse(r.url or final_url).netloc or "").lower()
         is_terabox_host = is_terabox_family_host(response_host)
 
         if r.status_code >= 400:
@@ -788,15 +1065,12 @@ def terabox_download(job_id, url, format_choice):
                 error_text = (r.text or "")[:500]
             except Exception:
                 error_text = ""
-
-            # d.* endpoints may reject server-side requests while browser-session download still works.
             is_user_not_exists = (
                 ("error_code" in error_text and "31045" in error_text)
                 or "user not exists" in error_text.lower()
             )
             if r.status_code in (401, 403) and (is_user_not_exists or is_terabox_host):
                 raise TeraboxExternalDownloadRequired(dlink=dlink, filename=original_name)
-
             raise Exception(f"Terabox download failed (HTTP {r.status_code})")
 
         with open(temp_path, "wb") as f:
@@ -814,13 +1088,16 @@ def terabox_download(job_id, url, format_choice):
             os.remove(temp_path)
         except OSError:
             pass
-        final_path = mp3_path
+        temp_path = mp3_path
         original_name = f"{os.path.splitext(original_name)[0] or 'audio'}.mp3"
 
-    return final_path, original_name
+    return temp_path, original_name, None
+
+
 
 
 def build_ytdlp_strategies(url):
+
     """Build retry strategies for yt-dlp args."""
     cookie_args = get_cookie_args()
     if is_youtube_url(url):
@@ -1265,17 +1542,31 @@ def run_download(job_id, url, format_choice, format_id):
     if is_terabox_url(url):
         try:
             logger.info(f"[{job_id}] Attempting Terabox direct download")
-            filepath, original_name = terabox_download(job_id, url, format_choice)
+            filepath, original_name, direct_url = terabox_download(job_id, url, format_choice)
             job["status"] = "done"
+
+            if direct_url:
+                # Fast path: redirect browser directly to Terabox CDN — no server buffering
+                job["external_url"] = direct_url
+                ext = os.path.splitext(original_name)[1] or ".mp4"
+                title = job.get("title", "").strip()
+                if title:
+                    safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:80].strip()
+                    job["filename"] = f"{safe_title}{ext}" if safe_title else original_name
+                else:
+                    job["filename"] = "".join(c for c in (original_name or "") if c not in r'\/:*?"<>|').strip() or f"download{ext}"
+                logger.info(f"[{job_id}] Terabox: direct browser download → {direct_url[:80]}")
+                return
+
+            # Slow path: file was downloaded to local disk
             job["file"] = filepath
             ext = os.path.splitext(filepath)[1]
-
             title = job.get("title", "").strip()
             if title:
-                safe_title = "".join(c for c in title if c not in r'\\/:*?"<>|').strip()[:80].strip()
+                safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:80].strip()
                 job["filename"] = f"{safe_title}{ext}" if safe_title else os.path.basename(filepath)
             else:
-                cleaned = "".join(c for c in (original_name or "") if c not in r'\\/:*?"<>|').strip()
+                cleaned = "".join(c for c in (original_name or "") if c not in r'\/:*?"<>|').strip()
                 job["filename"] = cleaned or os.path.basename(filepath)
 
             logger.info(f"[{job_id}] Terabox direct download successful")
@@ -1291,10 +1582,10 @@ def run_download(job_id, url, format_choice, format_id):
 
             title = job.get("title", "").strip()
             if title:
-                safe_title = "".join(c for c in title if c not in r'\\/:*?"<>|').strip()[:80].strip()
+                safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:80].strip()
                 job["filename"] = f"{safe_title}{ext}" if safe_title else (e.filename or f"download{ext}")
             else:
-                cleaned = "".join(c for c in (e.filename or "") if c not in r'\\/:*?"<>|').strip()
+                cleaned = "".join(c for c in (e.filename or "") if c not in r'\/:*?"<>|').strip()
                 job["filename"] = cleaned or f"download{ext}"
             return
         except Exception as e:
@@ -1420,6 +1711,76 @@ def health_check():
         "service": "clipdown",
         "cookie_mode": "browser" if COOKIES_FROM_BROWSER else ("file" if os.path.isfile(COOKIES_FILE) else "none"),
     })
+
+
+@app.route("/api/proxy-video")
+def proxy_video():
+    """Resolve Terabox dlink to its final signed CDN URL and redirect.
+
+    Terabox dlinks redirect to a CDN URL with auth baked into query params
+    (e.g. ?bkt=...). Once resolved, the CDN URL works directly in the browser
+    without any Cookie/Referer headers — so we just 302-redirect there.
+    """
+    raw_url = request.args.get("u", "").strip()
+    if not raw_url:
+        return jsonify({"error": "Missing url param"}), 400
+
+    from urllib.parse import unquote
+    video_url = unquote(raw_url)
+
+    # Security: only proxy Terabox-family URLs
+    allowed_hosts = ("terabox.app", "terabox.com", "1024tera", "data.terabox",
+                     "dm-d.terabox", "terabox.hnn", "d.pcs.baidu")
+    parsed_host = urlparse(video_url).netloc.lower()
+    if not any(h in parsed_host for h in allowed_hosts):
+        return jsonify({"error": "URL not allowed"}), 403
+
+    cookie_header = get_terabox_cookie_header()
+    headers = {
+        "User-Agent": TERABOX_USER_AGENT,
+        "Referer": "https://www.terabox.app/",
+    }
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+
+    try:
+        # Follow redirects to get the final signed CDN URL
+        r = requests.head(video_url, headers=headers, timeout=15, allow_redirects=True)
+        final_url = r.url  # The CDN URL with auth in query params
+        if r.status_code in (200, 206):
+            logger.info(f"proxy-video redirect → {final_url[:80]}")
+            return redirect(final_url, code=302)
+    except Exception as e:
+        logger.warning(f"proxy-video HEAD failed: {e}")
+
+    # Fallback: stream through server if redirect didn't work
+    try:
+        upstream = requests.get(video_url, headers=headers, stream=True,
+                                timeout=30, allow_redirects=True)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+    resp_headers = {
+        "Content-Type": upstream.headers.get("Content-Type", "video/mp4"),
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-store",
+    }
+    if "Content-Length" in upstream.headers:
+        resp_headers["Content-Length"] = upstream.headers["Content-Length"]
+    if "Content-Range" in upstream.headers:
+        resp_headers["Content-Range"] = upstream.headers["Content-Range"]
+
+    def generate():
+        try:
+            for chunk in upstream.iter_content(chunk_size=256 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+
+    return app.response_class(generate(),
+                              status=upstream.status_code if upstream.status_code in (200, 206) else 200,
+                              headers=resp_headers)
 
 
 @app.route("/api/info", methods=["POST"])
@@ -1632,7 +1993,43 @@ def debug_info():
     return jsonify(results)
 
 
+@app.route("/api/debug/terabox", methods=["POST"])
+def debug_terabox():
+    """Debug endpoint to diagnose Terabox extraction step-by-step."""
+    import traceback
+    data = request.json or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    result = {
+        "url": url,
+        "is_terabox": is_terabox_url(url),
+        "normalized_url": normalize_video_url(url),
+        "surl": extract_terabox_surl(normalize_video_url(url)),
+        "terabox_cookie_set": bool(get_terabox_cookie_header()),
+        "terabox_cookie_header_preview": (get_terabox_cookie_header() or "")[:80] + "…" if get_terabox_cookie_header() else "",
+    }
+
+    if not result["is_terabox"]:
+        result["note"] = "URL is not recognized as a Terabox URL."
+        return jsonify(result)
+
+    try:
+        info = terabox_get_info(url)
+        result["status"] = "success"
+        result["title"] = info.get("title")
+        result["terabox_dlink_preview"] = (info.get("terabox_dlink") or "")[:100] + "…"
+        result["thumbnail"] = info.get("thumbnail")
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+        result["traceback"] = traceback.format_exc()[-800:]
+
+    return jsonify(result)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8899))
     host = os.environ.get("HOST", "0.0.0.0")
-    app.run(host=host, port=port)
+    app.run(host=host, port=port, threaded=True)

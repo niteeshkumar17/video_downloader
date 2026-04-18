@@ -3,6 +3,8 @@ __pycache__/
 downloads/
 .env
 cookies.txt
+terabox_cookies.txt
+*terabox*cookies*.txt
 bad_cookies.txt
 err.txt
 out.txt
