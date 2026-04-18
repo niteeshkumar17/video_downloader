@@ -1127,15 +1127,17 @@
       }
 
       let actionHtml = '';
+      const isMkv = (c.filename || c.title || c.url || '').toLowerCase().includes('.mkv');
+
       if (c.status === 'ready') {
-        const playBtn = c.externalUrl
+        const playBtn = c.externalUrl && !isMkv
           ? `<button class="card-dl-btn play" onclick="playCard(${idx})" title="Play in browser">&#9654; Play</button>`
           : '';
         actionHtml = `${playBtn}<button class="card-dl-btn" onclick="dlCard(${idx})">Download</button>${qualityChips}`;
       } else if (c.status === 'downloading') {
         actionHtml = `<span class="card-status downloading"><span class="spin"></span> Downloading...</span>`;
       } else if (c.status === 'done') {
-        const playBtn = c.externalUrl
+        const playBtn = c.externalUrl && !isMkv
           ? `<button class="card-dl-btn play" onclick="playCard(${idx})" title="Play in browser">▶ Play</button>`
           : '';
         actionHtml = `${playBtn}<button class="card-dl-btn done" onclick="saveCard(${idx})">Save File</button>

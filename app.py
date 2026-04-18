@@ -1034,18 +1034,20 @@ def terabox_download(job_id, url, format_choice):
                           ".1024tera.com", "dm-d.terabox.app", ".dm-d.terabox.app"):
                     dl_session.cookies.set(k.strip(), v.strip(), domain=d)
 
-    # Quick HEAD check to verify the dlink is accessible before handing to browser
+    # Quick check to verify dlink and follow redirect to get CDN URL
     try:
-        head_r = dl_session.head(dlink, headers=headers, timeout=15, allow_redirects=True)
+        head_r = dl_session.get(dlink, headers=headers, stream=True, timeout=15, allow_redirects=True)
         final_url = head_r.url  # follow any redirects to get final CDN URL
-        if head_r.status_code == 200:
-            logger.info(f"[{job_id}] Terabox dlink HEAD OK → {final_url[:80]}")
-            # Store dlink for direct browser download — no server-side buffering
+        head_r.close()
+
+        if head_r.status_code == 200 and final_url != dlink:
+            logger.info(f"[{job_id}] Terabox dlink redirect OK → {final_url[:80]}")
+            # Store CDN URL for direct browser download — no server-side buffering
             return None, original_name, final_url
         elif head_r.status_code in (401, 403):
             raise TeraboxExternalDownloadRequired(dlink=dlink, filename=original_name)
         else:
-            logger.warning(f"[{job_id}] Terabox HEAD {head_r.status_code}, falling back to proxy download")
+            logger.warning(f"[{job_id}] Terabox GET {head_r.status_code}, falling back to proxy download")
             final_url = dlink
     except TeraboxExternalDownloadRequired:
         raise
@@ -1744,14 +1746,17 @@ def proxy_video():
         headers["Cookie"] = cookie_header
 
     try:
-        # Follow redirects to get the final signed CDN URL
-        r = requests.head(video_url, headers=headers, timeout=15, allow_redirects=True)
+        # Fetch the dlink with GET stream=True to accurately follow redirects.
+        # HEAD requests sometimes fail or return 200 without redirecting on Terabox CDN.
+        r = requests.get(video_url, headers=headers, stream=True, timeout=15, allow_redirects=True)
         final_url = r.url  # The CDN URL with auth in query params
-        if r.status_code in (200, 206):
+        r.close() # don't need body, just the redirected URL
+
+        if r.status_code in (200, 206) and final_url != video_url:
             logger.info(f"proxy-video redirect → {final_url[:80]}")
             return redirect(final_url, code=302)
     except Exception as e:
-        logger.warning(f"proxy-video HEAD failed: {e}")
+        logger.warning(f"proxy-video GET redirect failed: {e}")
 
     # Fallback: stream through server if redirect didn't work
     try:
